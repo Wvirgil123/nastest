@@ -20,12 +20,16 @@ def _impl(key: str):
 
 # ================= S3 RAID 子组校验(basic / RAID0/1/5/6/10) =================
 def detect_md_raid(ctx: Ctx) -> str | None:
-    """解析 /proc/mdstat 识别当前 md 阵列级别(RAID0/1/5/6/10);无阵列返回 None。"""
+    """解析 /proc/mdstat 识别当前 md 阵列级别(RAID0/1/5/6/10);无阵列返回 None。
+
+    只匹配阵列行(mdX : active raidN …)。注意首行 Personalities 是内核能力清单
+    ([raid0] [raid1] …),不能参与匹配,否则永远误判为 RAID0。
+    """
     md = ctx.sh("cat /proc/mdstat", note="识别当前 RAID 级别").out
-    m = re.search(r"\braid(\d+)\b", md)          # raid10 整体贪婪匹配,不会误判为 raid1
-    if m:
-        return f"RAID{m.group(1)}"
-    return None
+    m = re.search(r"\bmd\d+\s*:\s*active\s+(?:linear|raid(\d+))", md)
+    if not m or not m.group(1):
+        return None
+    return f"RAID{m.group(1)}"
 
 
 def _verify_raid_group(ctx: Ctx) -> str | None:
