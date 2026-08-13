@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}任务列表 · ARM-NAS 极限性能测试{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>性能测试任务</h1>
+  <a class="btn btn-primary" href="/runs/new">+ 新建测试任务</a>
+</div>
+{% if not runs %}
+<div class="empty">还没有测试任务。点击右上角「新建测试任务」,配置被测设备后开始。</div>
+{% else %}
+<table class="table">
+  <thead><tr>
+    <th>ID</th><th>名称</th><th>设备</th><th>状态</th><th>阶段</th>
+    <th>进度</th><th>创建时间</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td>#{{ r.id }}</td>
+      <td><a href="/runs/{{ r.id }}">{{ r.name }}</a></td>
+      <td>{{ r.config.device_model }}<br><small>{{ r.config.device_ip }}</small></td>
+      <td><span class="badge st-run-{{ r.status }}">{{ {'pending':'待开始','running':'运行中','paused':'已暂停','completed':'已完成','aborted':'已中止'}[r.status] }}</span></td>
+      <td>{{ {'created':'已创建','preflight':'环境检查','auto':'自动测试','manual':'人工测试','report':'报告'}[r.phase] }}</td>
+      <td>{{ r.done }}/{{ r.total }}</td>
+      <td><small>{{ r.created_str }}</small></td>
+      <td>
+        <a class="btn btn-sm" href="/runs/{{ r.id }}">打开</a>
+        <a class="btn btn-sm" href="/runs/{{ r.id }}/report">报告</a>
+        <button class="btn btn-sm btn-danger" data-name="{{ r.name }}" onclick="delRun({{ r.id }}, this.dataset.name)">删除</button>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}
+{% block scripts %}
+<script>
+async function delRun(id, name) {
+  if (!confirm(`确认删除任务 #${id}「${name}」?\n将同时删除其全部测试结果与证据目录(日志/fio 原始输出等),不可恢复。`)) return;
+  try {
+    const r = await fetch('/api/runs/' + id, {method: 'DELETE'});
+    if (!r.ok) {
+      let msg = r.statusText;
+      try { msg = (await r.json()).detail || msg; } catch (e) {}
+      alert('删除失败: ' + msg);
+      return;
+    }
+    location.reload();
+  } catch (e) { alert('删除失败: ' + e.message); }
+}
+</script>
+{% endblock %}

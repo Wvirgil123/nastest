@@ -1,0 +1,15 @@
+# 测试数据:数据库内含明文密码(ssh_pass/smb_pass/local_sudo_pass),严禁入库;
+# 证据目录(stdout.log/fio 原始输出/soak.csv)体积大且含设备信息,同样不入库
+nastest/data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 杂项
+nohup.out
+*.log
+.DS_Store

@@ -1,0 +1,24 @@
+{% if entry %}
+<details class="method-block" {% if entry_open %}open{% endif %}>
+  <summary>📖 测试方法 · 底层原理 · 使用的命令</summary>
+  <div class="method-body">
+    <div class="method-col">
+      <b>测试方法(步骤)</b>
+      <ol class="small">
+        {% for s in entry.method %}<li>{{ s }}</li>{% endfor %}
+      </ol>
+      <b>底层原理</b>
+      <ul class="small">
+        {% for s in entry.principle %}<li>{{ s }}</li>{% endfor %}
+      </ul>
+    </div>
+    {% if entry.commands %}
+    <div class="method-col">
+      <b>使用的命令</b>
+      <div class="small muted">逐条完整命令日志见证据 stdout.log</div>
+      {% for c in entry.commands %}<pre class="cmd">{{ c }}</pre>{% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</details>
+{% endif %}

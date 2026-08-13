@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}任务 #{{ run_id }} · ARM-NAS 极限性能测试{% endblock %}
+{% block content %}
+<div id="run-head" class="page-head">
+  <h1 id="run-title">任务 #{{ run_id }}</h1>
+  <div>
+    <span id="run-status" class="badge"></span>
+    <span id="run-phase" class="badge badge-dim"></span>
+  </div>
+</div>
+<div id="cfg-summary" class="muted small"></div>
+
+<!-- Preflight -->
+<section class="card" id="preflight-card">
+  <h3>① 环境检查(Preflight)</h3>
+  <div class="actions">
+    <button class="btn" onclick="doPreflightCheck()">运行环境检查</button>
+    <button class="btn btn-primary" id="btn-install" onclick="doPreflightInstall()" style="display:none">设备端安装缺失依赖(sudo apt)</button>
+    <button class="btn btn-primary" id="btn-install-local" onclick="doPreflightInstallLocal()" style="display:none">本机安装缺失依赖(需 sudo 密码)</button>
+  </div>
+  <div id="preflight-out" class="mono small"></div>
+  <pre id="install-log" class="logbox" style="display:none"></pre>
+  <pre id="install-local-log" class="logbox" style="display:none"></pre>
+</section>
+
+<!-- 控制 -->
+<section class="card">
+  <h3>② 执行控制</h3>
+  <div class="actions">
+    <button class="btn btn-primary" id="btn-start" onclick="doStart()">▶ 开始自动测试</button>
+    <button class="btn" id="btn-pause" onclick="doPause()" style="display:none">⏸ 暂停</button>
+    <button class="btn btn-danger" id="btn-abort" onclick="doAbort()" style="display:none">✖ 中止</button>
+    <button class="btn" id="btn-report" onclick="genReport()">📄 生成报告</button>
+    <a class="btn" id="btn-report-view" href="/runs/{{ run_id }}/report">查看报告</a>
+    <button class="btn btn-danger" id="btn-delete" onclick="doDelete()">🗑 删除任务</button>
+  </div>
+  <div id="progress" class="progress-wrap"></div>
+  <div id="grade-line" class="small muted"></div>
+  <div id="manual-banner" class="banner-info" style="display:none"></div>
+</section>
+
+<!-- 用例 -->
+<section class="card">
+  <h3>③ 用例执行(人工用例统一放在自动阶段之后)</h3>
+  <div class="legend small muted">
+    层次:峰=峰值 持=持续 破=极限容量 · ⚠=高危(需输入编号确认) ·
+    状态:✅完成 ❌失败 ⏭跳过 🚫受阻 🙋待人工 ⬜未测 🔄运行中
+  </div>
+  <div id="domains"></div>
+</section>
+
+<!-- 用例详情弹窗 -->
+<div id="modal-mask" class="modal-mask" style="display:none" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="m-title"></h2>
+      <button class="btn btn-sm" onclick="closeModal()">关闭</button>
+    </div>
+    <div id="m-body" class="modal-body"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const RUN_ID = {{ run_id }};
+const CASES = {{ cases_json | safe }};
+const DOMAIN_ORDER = {{ domain_order | tojson }};
+const DOMAIN_NAMES = {{ domain_names | tojson }};
+</script>
+<script src="/static/app.js?v=2"></script>
+{% endblock %}

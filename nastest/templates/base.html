@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}ARM-NAS 极限性能测试{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="/">⚡ ARM-NAS 极限性能测试</a>
+    <nav>
+      <a href="/">任务列表</a>
+      <a href="/runs/new">+ 新建测试任务</a>
+    </nav>
+  </div>
+</header>
+<main class="container">
+{% block content %}{% endblock %}
+</main>
+<footer class="footer">ARM-NAS 极限性能测试框架 · 依据 docs/ARM-NAS-极限性能测试方案.md(§3 纪律 / §7 报告 / §8 评级)</footer>
+{% block scripts %}{% endblock %}
+</body>
+</html>

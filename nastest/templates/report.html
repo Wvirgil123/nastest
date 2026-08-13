@@ -1,0 +1,238 @@
+{% extends "base.html" %}
+{% block title %}性能报告 · {{ run.name }}{% endblock %}
+{% block content %}
+<div class="report-head">
+  <div class="page-head">
+    <h1>{{ run.name }} — ARM-NAS 极限性能报告</h1>
+    <div>
+      <a class="btn" href="/runs/{{ run.id }}/report.md" download>⬇ 下载 Markdown</a>
+      <a class="btn" href="/runs/{{ run.id }}">返回任务</a>
+    </div>
+  </div>
+  <div class="muted small">
+    被测设备:{{ cfg.device_model }}({{ cfg.device_ip }}) ·
+    存储:{{ cfg.disk_desc }} {{ cfg.raid_level }} 卷 {{ cfg.volume_path }} ·
+    协议:{{ cfg.protocols | join('/') }} · 线速 {{ cfg.nic_link_mbps }}Mbps ·
+    rounds={{ cfg.rounds }} fio={{ cfg.fio_size }}/{{ cfg.fio_runtime }}s · 任务 #{{ run.id }}
+  </div>
+  <div class="small" style="margin-top:8px">
+    完成度 <b>{{ score.completion_pct }}%</b>(完成 {{ score.completed }}/{{ score.total }}) ·
+    ✅{{ score.counts.get('pass',0) }} ❌{{ score.counts.get('fail',0) }}
+    ⏭{{ score.counts.get('skipped',0) }} 🚫{{ score.counts.get('blocked',0) }}
+    🙋{{ score.counts.get('manual_pending',0) }} ⬜{{ score.counts.get('pending',0) }}
+  </div>
+</div>
+
+<!-- 基线信息卡 -->
+<section class="card">
+  <h3>一、基线信息(§3.2)</h3>
+  {% if baseline %}
+  <div class="baseline-grid">
+    <div class="cell"><b>内核</b>{{ baseline.uname }}</div>
+    <div class="cell"><b>CPU</b>{{ baseline.cores }} 核 · 大小核 {{ '是' if baseline.big_little else '否' }} · 频率 {{ baseline.max_freq_khz | join('/') }}kHz</div>
+    <div class="cell"><b>governor</b>{{ baseline.governor }}</div>
+    <div class="cell"><b>AES 硬件指令(aes-ce)</b>{{ '✅ 已启用' if baseline.aes_ce else '❌ 未启用(红旗)' }}</div>
+    <div class="cell"><b>内存 / 页大小</b>{{ baseline.mem_mb }}MB / {{ baseline.page_size }}B</div>
+    <div class="cell"><b>卷</b><span class="mono">{{ baseline.fs_line }}</span></div>
+    <div class="cell"><b>网卡</b>{{ baseline.nic }} @ {{ baseline.nic_speed_mbps }}Mbps</div>
+    {% for s in baseline.smart or [] %}<div class="cell"><b>SMART</b>{{ s }}</div>{% endfor %}
+  </div>
+  {% else %}
+  <div class="muted">未执行 S0-01 基线采集。</div>
+  {% endif %}
+</section>
+
+<!-- 四问答 -->
+<section class="card">
+  <h3>二、四个核心问题(§1)</h3>
+  {% for fq in score.four_questions %}
+  <div class="qa">
+    <b>{{ fq.q }}</b>
+    <div class="a">{{ fq.a }}</div>
+    <div class="detail">{{ fq.detail }}</div>
+  </div>
+  {% endfor %}
+</section>
+
+<!-- 存储表(按 RAID 细分) -->
+<section class="card">
+  <h3>三、存储子系统(§5.3,中位数)</h3>
+  {% if tables.storage.hint %}<div class="banner-info small">{{ tables.storage.hint }}</div>{% endif %}
+  {% if tables.storage.multi %}
+    {% for lv in tables.storage.levels %}
+    <h4 style="margin:14px 0 6px">{{ lv.raid }}</h4>
+    <div class="table-scroll">
+    <table class="table">
+      <thead><tr><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th>备注</th></tr></thead>
+      <tbody>
+      {% for r in lv.rows %}
+      <tr><td>{{ r.case }} <span class="mono muted small">{{ r.case_id }}</span></td><td class="small">{{ r.spec }}</td>
+        <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
+        <td>{{ r.p50 if r.p50 is not none else '—' }}</td><td>{{ r.p99 if r.p99 is not none else '—' }}</td>
+        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.note }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% endfor %}
+  {% else %}
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>RAID</th><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th>备注</th></tr></thead>
+    <tbody>
+    {% for r in tables.storage.levels[0].rows %}
+      {% if r.empty %}
+      <tr class="muted"><td>{{ r.raid }}</td><td>{{ r.case }}</td><td>{{ r.spec }}</td><td colspan="5">—</td><td>未测</td></tr>
+      {% else %}
+      <tr><td>{{ r.raid }}</td><td>{{ r.case }} <span class="mono muted small">{{ r.case_id }}</span></td><td class="small">{{ r.spec }}</td>
+        <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
+        <td>{{ r.p50 if r.p50 is not none else '—' }}</td><td>{{ r.p99 if r.p99 is not none else '—' }}</td>
+        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.note }}</td></tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+  {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
+</section>
+
+<!-- 协议表 -->
+<section class="card">
+  <h3>四、文件协议(§5.5)</h3>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>协议</th><th>负载</th><th>吞吐(MB/s)</th><th>IOPS</th><th>CPU%</th><th>加密</th><th>备注</th></tr></thead>
+    <tbody>
+    {% for r in tables.protocol %}
+    <tr><td>{{ r.proto }}</td><td>{{ r.load }}</td>
+      <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
+      <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td>{{ r.enc or '—' }}</td><td class="small">{{ r.note }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% with entry = method.protocol %}{% include "_method_block.html" %}{% endwith %}
+</section>
+
+<!-- 并发表 -->
+<section class="card">
+  <h3>五、并发扩展(§5.6)</h3>
+  {% if tables.scale %}
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>类型</th><th>客户端数</th><th>聚合吞吐(MB/s)</th><th>CPU%</th><th>网络(MB/s)</th></tr></thead>
+    <tbody>
+    {% for r in tables.scale %}
+    <tr><td>{{ r.kind }}</td><td>{{ r.n }}</td><td>{{ r.mbps if r.mbps is not none else '—' }}</td>
+      <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td>{{ r.net if r.net is not none else '—' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% if tables.scale_note %}<div class="small" style="margin-top:6px">{{ tables.scale_note }}</div>{% endif %}
+  {% else %}<div class="muted">未执行 S6-01/S6-02。</div>{% endif %}
+  {% with entry = method.scale %}{% include "_method_block.html" %}{% endwith %}
+</section>
+
+<!-- 浸泡小时表 -->
+<section class="card">
+  <h3>六、浸泡(§5.8)</h3>
+  {% if tables.soak %}
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>时段</th><th>吞吐(MB/s)</th><th>IOPS</th><th>CPU 温度(℃)</th><th>最高温</th><th>CPU 频率(MHz)</th><th>CPU%</th><th>功耗</th><th>异常事件</th></tr></thead>
+    <tbody>
+    {% for r in tables.soak %}
+    <tr><td>第{{ r.hour }}h</td><td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
+      <td>{{ r.temp_c if r.temp_c is not none else '—' }}</td><td>{{ r.temp_max if r.temp_max is not none else '—' }}</td>
+      <td>{{ r.freq_mhz if r.freq_mhz is not none else '—' }}</td><td>{{ r.cpu_pct if r.cpu_pct is not none else '—' }}</td>
+      <td>—</td><td class="small">{{ r.events }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="small muted">功耗列需功率计人工录入(S9-01);逐分钟样本见证据 S8-01/soak.csv。</div>
+  {% else %}<div class="muted">未执行 S8-01 浸泡。</div>{% endif %}
+  {% with entry = method.soak %}{% include "_method_block.html" %}{% endwith %}
+</section>
+
+<!-- §8 评级 -->
+<section class="card">
+  <h3>七、评级(§8 参考基线:优 / 良 / 及格 / 差)</h3>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th style="width:200px">指标</th><th style="width:130px">实测</th><th style="width:80px">评级</th><th>依据</th></tr></thead>
+    <tbody>
+    {% for g in score.grades %}
+    <tr><td>{{ g.name }}</td><td class="mono">{{ g.value }}</td>
+      <td><span class="grade {{ 'grade-none' if g.grade == '—' else 'grade-' + g.grade }}">{{ g.grade }}</span></td>
+      <td class="small">{{ g.basis }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<!-- 红旗 -->
+<section class="card">
+  <h3>八、ARM 红旗信号(§8)</h3>
+  {% for f in score.red_flags %}
+  <div style="margin:8px 0">
+    {% if f.triggered %}<span class="flag-hit">🚩 触发</span>
+    {% elif f.triggered == false %}<span class="flag-ok">✅ 未触发</span>
+    {% else %}<span class="flag-unknown">❔ 数据不足</span>{% endif %}
+    — {{ f.desc }}
+    <div class="small muted" style="margin-left:22px">{{ f.detail }}</div>
+  </div>
+  {% endfor %}
+</section>
+
+<!-- 人工项 -->
+{% if manual_rows %}
+<section class="card">
+  <h3>九、待人工项与操作指引</h3>
+  {% for mr in manual_rows %}
+  <details style="margin:6px 0">
+    <summary><b>{{ mr.id }} {{ mr.title }}</b> <span class="badge st-{{ mr.status }}">{{ mr.status_cn }}</span></summary>
+    <div class="small" style="white-space:pre-wrap;margin:8px 0 8px 12px">{{ mr.guide or '(见用例详情)' }}</div>
+  </details>
+  {% endfor %}
+</section>
+{% endif %}
+
+<!-- 用例明细附录 -->
+{% for dom in domains %}
+<section class="card">
+  <h3>附录:{{ dom }} {{ domain_names[dom] }}</h3>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th style="width:64px">编号</th><th style="width:200px">测试项</th><th>测试方法</th><th style="width:50px">层次</th><th style="width:70px">方式</th><th style="width:90px">状态</th><th>实测结果</th><th style="width:70px">耗时</th></tr></thead>
+    <tbody>
+    {% for row in rows %}
+      {% if row.case.domain == dom %}
+      <tr class="st-row-{{ row.status }}">
+        <td class="mono">{{ row.case.id }}</td>
+        <td>{{ row.case.title }}</td>
+        <td class="small">{{ row.case.steps }}</td>
+        <td class="small">{{ tier_cn.get(row.case.tier, row.case.tier) }}</td>
+        <td class="small">{{ '自动' if row.case.mode == 'auto' else '人工' }}</td>
+        <td class="small">{{ status_cn.get(row.status, row.status) }}</td>
+        <td class="small">{% if row.result.actual %}{{ row.result.actual | replace("\n", " ⏎ ") }}{% else %}—{% endif %}</td>
+        <td class="small">{% if row.duration_s %}{{ row.duration_s }}s{% else %}—{% endif %}</td>
+      </tr>
+      {% endif %}
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+{% endfor %}
+
+<section class="card small muted">
+  <b>证据说明</b>:每条用例的命令日志(stdout.log)、指标(metrics.json)与原始输出位于
+  <span class="mono">{{ evidence_dir }}/cases/&lt;用例编号&gt;/</span>;浸泡采样 <span class="mono">S8-01/soak.csv</span>,
+  基线卡 <span class="mono">S0-01/baseline.md</span>。data/ 含明文配置,勿外传。
+  本报告由 ARM-NAS 极限性能测试框架生成;评级依据方案 §8,受阻/待人工项补测后重新生成。
+</section>
+{% endblock %}
