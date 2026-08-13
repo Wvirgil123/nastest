@@ -164,9 +164,11 @@ def score_run(run_id: int) -> dict:
                      f"{round(smb_w / (iperf_tx or link_mb_s) * 100) if iperf_tx else '—'}%)")
     if seq_w:
         parts.append(f"本地顺序写 {seq_w}MB/s")
-    fio_cpu = _s3(results, lv, "02", "seq_write_fio_cpu_pct")
-    if fio_cpu is not None:
-        parts.append(f"写入时 fio CPU {fio_cpu}%")
+    dev_cpu = _s3(results, lv, "02", "seq_write_dev_cpu_pct")
+    if dev_cpu is None:  # 旧数据回退 fio 自报值
+        dev_cpu = _s3(results, lv, "02", "seq_write_fio_cpu_pct")
+    if dev_cpu is not None:
+        parts.append(f"写入时设备 CPU {dev_cpu}%")
     four.append({"q": "瓶颈在哪一层?",
                  "a": ";".join(parts) if parts else "数据不足(需完成 S3/S4/S5)",
                  "detail": "对比链:本地卷(fio)→ 协议(SMB/NFS)→ 裸 TCP(iperf3)→ 线速;"

@@ -63,6 +63,12 @@ def _m(m: dict, key: str):
     return v if isinstance(v, (int, float)) else None
 
 
+def _cpu(m: dict, prefix: str):
+    """CPU%:优先设备整机 /proc/stat 占用(dev_cpu_pct);旧数据回退 fio 自报值。"""
+    v = _m(m, f"{prefix}_dev_cpu_pct")
+    return v if v is not None else _m(m, f"{prefix}_fio_cpu_pct")
+
+
 # ---------------- 表格组装 ----------------
 def _raid_levels(results: dict) -> list[str]:
     """汇总所有 S3 用例实际测过的 RAID 级别(按 RAID0/1/5/6/10 排序)。"""
@@ -100,12 +106,15 @@ def _storage_row(m: dict, cid: str, name: str, spec: str, prefix: str,
     else:
         mb_s = keyfn(f"{prefix}_{side}_mbps")
         iops = keyfn(f"{prefix}_{side}_iops")
+    cpu = keyfn(f"{prefix}_dev_cpu_pct")   # 整机 CPU%(/proc/stat 快照)优先
+    if cpu is None:                        # 旧数据无此键时回退 fio 自报值
+        cpu = keyfn(f"{prefix}_fio_cpu_pct")
     return {
         "case_id": cid, "case": name, "spec": spec, "raid": raid,
         "mb_s": mb_s, "iops": iops,
         "p50": keyfn(f"{prefix}_{side}_p50_us"),
         "p99": keyfn(f"{prefix}_{side}_p99_us"),
-        "cpu": keyfn(f"{prefix}_fio_cpu_pct"),
+        "cpu": cpu,
         "note": ("fsync 延迟 "
                  f"{_fmt(keyfn(f'{prefix}_fsync_lat_us'), 'μs')}"
                  if prefix == "fsync_lat" else ""),
@@ -167,29 +176,34 @@ def protocol_table(results: dict) -> list[dict]:
                   "p99": p99, "cpu": cpu, "enc": enc, "note": note})
 
     s51 = _metrics(results, "S5-01")
-    add("SMB 纯软件", "大文件写", _m(s51, "write_mbps"), enc="否")
-    add("SMB 纯软件", "大文件读", _m(s51, "read_mbps"), enc="否")
+    add("SMB 纯软件", "大文件写", _m(s51, "write_mbps"),
+        cpu=_m(s51, "write_cpu_pct"), enc="否")
+    add("SMB 纯软件", "大文件读", _m(s51, "read_mbps"),
+        cpu=_m(s51, "read_cpu_pct"), enc="否")
     s52 = _metrics(results, "S5-02")
-    add("SMB seal", "大文件写", _m(s52, "seal_write_mbps"), enc="是",
+    add("SMB seal", "大文件写", _m(s52, "seal_write_mbps"),
+        cpu=_m(s52, "seal_write_cpu_pct"), enc="是",
         note=f"较明文损失 {_fmt(_m(s52, 'encrypt_loss_write_pct'), '%')}")
-    add("SMB seal", "大文件读", _m(s52, "seal_read_mbps"), enc="是",
+    add("SMB seal", "大文件读", _m(s52, "seal_read_mbps"),
+        cpu=_m(s52, "seal_read_cpu_pct"), enc="是",
         note=f"较明文损失 {_fmt(_m(s52, 'encrypt_loss_read_pct'), '%')}")
     for cid, proto in (("S5-03", "SMB 挂载"), ("S5-04", "NFS 挂载")):
         m = _metrics(results, cid)
         add(proto, "fio 顺序写", _m(m, "seq_write_w_mbps"),
-            cpu=_m(m, "seq_write_fio_cpu_pct"),
+            cpu=_cpu(m, "seq_write"),
             note="(direct=0 回退,含客户端缓存)" if m.get("direct_fallback") else "")
         add(proto, "fio 顺序读", _m(m, "seq_read_r_mbps"),
-            cpu=_m(m, "seq_read_fio_cpu_pct"))
+            cpu=_cpu(m, "seq_read"))
         add(proto, "fio 混合 IOPS", None, iops=_m(m, "randrw_mixed_iops"))
     s55 = _metrics(results, "S5-05")
-    add("FTP", "上传", _m(s55, "upload_mbps"))
-    add("FTP", "下载", _m(s55, "download_mbps"))
+    add("FTP", "上传", _m(s55, "upload_mbps"), cpu=_m(s55, "upload_cpu_pct"))
+    add("FTP", "下载", _m(s55, "download_mbps"), cpu=_m(s55, "download_cpu_pct"))
     s56 = _metrics(results, "S5-06")
-    add("WebDAV", "PUT", _m(s56, "upload_mbps"))
-    add("WebDAV", "GET", _m(s56, "download_mbps"))
+    add("WebDAV", "PUT", _m(s56, "upload_mbps"), cpu=_m(s56, "upload_cpu_pct"))
+    add("WebDAV", "GET", _m(s56, "download_mbps"), cpu=_m(s56, "download_cpu_pct"))
     s58 = _metrics(results, "S5-08")
     add("rsync(SSH)", "备份推送", _m(s58, "rsync_mbps"),
+        cpu=_m(s58, "rsync_cpu_pct"),
         note="含 SSH 加密开销")
     s59 = _metrics(results, "S5-09")
     if s59:
@@ -315,6 +329,7 @@ def methodology(cfg: dict) -> dict:
             "method": [
                 f"设备端 fio,direct=1 直通存储(绕开页缓存),单 job 测试文件 {size}(需大于物理内存,防止缓存作假);",
                 f"每个 profile 先热身 {warm}s,再正式跑 {rounds} 轮取中位数,轮间波动 >10% 自动标记可信度下降;",
+                "每轮 fio 前后对设备打 /proc/stat 快照,差值即该轮整机 CPU%(含内核态),多轮取中位数;",
                 "7 个负载画像:顺序读/写(1M 大块)、4K 随机读/写、4K 混合读写 70/30、QD1 最低延迟、fsync 提交延迟;",
                 "S3-BASE-01 自动从 /proc/mdstat 识别 RAID 成员盘做只读裸盘基线,用于换算文件系统层损耗与 RAID 效率;",
                 "S3 分为 basic / RAID0 / RAID1 / RAID5 / RAID6 / RAID10 子组:人工切换阵列后运行对应组,"
@@ -324,7 +339,10 @@ def methodology(cfg: dict) -> dict:
                 "direct=1 + 文件>内存,确保测的是磁盘/RAID 真实性能而非内存缓存;",
                 "1M 大块顺序 IO 反映带宽上限(受盘顺序速率与 RAID 条带/奇偶校验开销制约);4K 随机 IO 反映 IOPS 与延迟(受寻道/队列深度制约);",
                 "iodepth×numjobs 把队列打满以逼出设备峰值;QD1 单队列给出最低延迟(单路径极限);fsync=1 测每次落盘提交延迟,是数据库类负载的关键指标;",
-                "percentile(50/90/99/99.9)延迟用于暴露长尾;CPU% 用于判断算力是否先于存储成为瓶颈。",
+                "percentile(50/90/99/99.9)延迟用于暴露长尾;",
+                "CPU% 口径为设备整机利用率(/proc/stat 前后差值,含 RAID 奇偶校验、文件系统内核线程、"
+                "softirq 等内核态开销),用于判断算力是否先于存储成为瓶颈;"
+                "fio 自报 CPU 仅为其进程自身占用,已另存 fio_proc_cpu_pct 供参考,不作为报告 CPU%。",
             ],
             "commands": [
                 f"# 顺序读(S3-<RAID级别>-01),其余 profile 仅 --rw/--bs/--iodepth 不同\n"
@@ -338,6 +356,8 @@ def methodology(cfg: dict) -> dict:
                 f"# 裸盘读基线(S3-BASE-01,sdX 由 /proc/mdstat 自动识别,只读安全)\n"
                 f"fio --name=rawread --filename=/dev/sdX --rw=read --bs=128k "
                 f"--iodepth=32 --numjobs=1 --direct=1 --time_based --runtime={rt} --output-format=json",
+                "# 每轮 fio 前后各打一次快照,差值 = 该轮设备整机 CPU%\n"
+                "head -1 /proc/stat",
             ],
         },
         "protocol": {
@@ -345,7 +365,9 @@ def methodology(cfg: dict) -> dict:
                 "SMB 两条路径:smbprotocol 纯软件直连(无需 root,兜底)与内核 mount -t cifs(cache=none、rsize/wsize=1M)后本机 fio;",
                 "NFS:设备端自动写 /etc/exports 并 exportfs -ra,本机 mount vers=4.1 nconnect=8 后 fio;",
                 "FTP(ftplib STOR/RETR)、WebDAV(httpx PUT/GET)、rsync(SSH)大文件计时;SMB 小文件 1 万个 4K~64K 写/读/删计时;",
-                "SMB seal(加密)在同一大文件上开/关各传一次,计算加密损失%。",
+                "SMB seal(加密)在同一大文件上开/关各传一次,计算加密损失%;",
+                "CPU% 为设备端整机利用率:每个传输阶段(或挂载 fio 运行)前后对设备打 /proc/stat 快照取差值,"
+                "挂载 fio 在本机运行,计的是 NAS 侧而非客户端 CPU。",
             ],
             "principle": [
                 "同一大文件在不同协议下计时,横向对比协议封装/加密/网络往返带来的开销;",

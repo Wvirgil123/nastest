@@ -47,11 +47,18 @@ def parse_fio_json(text: str) -> dict:
             if p in pct:
                 tag = p.split(".")[0] if not p.startswith("99.9") else "999"
                 out[f"{key}_p{tag}_us"] = round(pct[p] / 1000.0, 2)
-    # CPU 占用(fio 自身记录)
+    # CPU 占用(fio 自身记录,仅辅助参考):group_reporting 下 fio 报告的是
+    # 各 job 的平均单核占用,×numjobs 换算为 fio 进程组总占用(单核倍数)。
+    # 注意:不含内核态开销(RAID/文件系统线程、softirq),整机 CPU% 以
+    # /proc/stat 快照(*_dev_cpu_pct)为准。
     usr = job.get("usr_cpu")
     sysv = job.get("sys_cpu")
     if usr is not None:
-        out["fio_cpu_pct"] = round((usr or 0) + (sysv or 0), 1)
+        try:
+            njobs = max(1, int((job.get("job options") or {}).get("numjobs") or 1))
+        except (TypeError, ValueError):
+            njobs = 1
+        out["fio_proc_cpu_pct"] = round(((usr or 0) + (sysv or 0)) * njobs, 1)
     return out
 
 

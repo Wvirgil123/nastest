@@ -476,6 +476,7 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
     size = size or ctx.cfg.get("fio_size", "4G")
     warm = int(ctx.cfg.get("warmup_seconds", 30))
     n = rounds(ctx)
+    nic = device_nic(ctx)
     ctx.log(f"profile={key} size={size} runtime={runtime}s warmup={warm}s rounds={n}")
     if warm > 0:
         r = ctx.sh(fio_cmd(key, tdir, warm, size), timeout=warm + 600,
@@ -483,12 +484,16 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
         if r.rc != 0:
             ctx.abort("fail", f"热身 fio 失败 rc={r.rc}({key}):测试目录 {tdir} 不可用?"
                               f"常见原因:卷未挂载/不支持 direct=1/目录无写权限,详见 stdout.log")
-    per_round, raws = [], []
+    per_round, raws, cpus = [], [], []
     for i in range(n):
         if ctx.stop_requested():
             ctx.abort("fail", "用户中止")
+        pre = device_snapshot(ctx, nic)
         r = ctx.sh(fio_cmd(key, tdir, runtime, size), timeout=runtime + 600,
                    note=f"第 {i + 1}/{n} 轮")
+        delta = device_delta(pre, device_snapshot(ctx, nic))
+        if delta.get("cpu_pct") is not None:
+            cpus.append(delta["cpu_pct"])
         if r.rc != 0:
             ctx.abort("fail", f"fio 运行失败 rc={r.rc}({key}) 第 {i + 1} 轮:"
                               f"测试目录 {tdir} 不可用?常见原因:卷未挂载/文件系统不支持"
@@ -510,6 +515,8 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
     if "r_iops" in med and "w_iops" in med:
         mixed = [d.get("r_iops", 0) + d.get("w_iops", 0) for d in per_round]
         med["mixed_iops"] = record_rounds(ctx, f"{key}_mixed_iops", mixed)
+    if cpus:  # 设备整机 CPU%(/proc/stat 快照差值,含内核态),报告 CPU% 列以此为准
+        med["dev_cpu_pct"] = record_rounds(ctx, f"{key}_dev_cpu_pct", cpus)
     ctx.sh(f"rm -f {tdir}/{key}.*", note="清理测试文件")
     if not any(med.get(k) for k in ("r_mbps", "w_mbps", "r_iops", "w_iops",
                                     "fsync_lat_us")):
@@ -524,15 +531,22 @@ def fio_local(ctx: Ctx, key: str, directory: str, runtime: int | None = None,
     require_local_tool(ctx, "fio")
     runtime = runtime or int(ctx.cfg.get("fio_runtime", 60))
     size = size or ctx.cfg.get("fio_size", "4G")
+    nic = device_nic(ctx)
     direct = 1
+    pre = device_snapshot(ctx, nic)
     r = ctx.sh_local(fio_cmd(key, directory, runtime, size, direct=direct),
                      timeout=runtime + 600, note=f"本机 fio {key}(挂载点)")
     if r.rc != 0 and "invalid argument" in (r.out + r.err).lower():
         ctx.log("[!] direct=1 在该挂载上不支持,回退 direct=0(含客户端缓存影响,已在报告注明)")
         direct = 0
         ctx.metric("direct_fallback", True)
+        pre = device_snapshot(ctx, nic)
         r = ctx.sh_local(fio_cmd(key, directory, runtime, size, direct=direct),
                          timeout=runtime + 600, note=f"本机 fio {key}(direct=0 重试)")
+    # fio 在本机运行,设备端 CPU 用 /proc/stat 快照差值计量(NAS 侧整机占用)
+    delta = device_delta(pre, device_snapshot(ctx, nic))
+    if delta.get("cpu_pct") is not None:
+        ctx.metric(f"{key}_dev_cpu_pct", delta["cpu_pct"])
     if r.rc != 0:
         ctx.abort("fail", f"本机 fio 运行失败 rc={r.rc}")
     try:

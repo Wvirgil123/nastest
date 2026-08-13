@@ -35,6 +35,13 @@ _CHUNK = 1024 * 1024
 _BLOCK = b"\xa5" * _CHUNK
 
 
+def _save_cpu(ctx: Ctx, key: str, pre: dict, post: dict) -> None:
+    """记录传输阶段内设备整机 CPU%(/proc/stat 快照差值)。"""
+    d = device_delta(pre, post)
+    if d.get("cpu_pct") is not None:
+        ctx.metric(key, d["cpu_pct"])
+
+
 def _smb_write_mb(path: str, mb: int) -> float:
     t0 = time.time()
     with smbclient.open_file(path, mode="wb", buffering=_CHUNK) as f:
@@ -61,9 +68,14 @@ def s5_smb_soft(ctx: Ctx) -> str:
     share = smb_pick_share(ctx, host)
     mb = int(ctx.cfg.get("smb_bigfile_mb", 512))
     path = f"\\\\{host}\\{share}\\nastest_perf_{mb}.bin"
+    nic = device_nic(ctx)
     try:
+        pre = device_snapshot(ctx, nic)
         ws = _smb_write_mb(path, mb)
+        _save_cpu(ctx, "write_cpu_pct", pre, device_snapshot(ctx, nic))
+        pre = device_snapshot(ctx, nic)
         rs, _ = _smb_read_mb(path)
+        _save_cpu(ctx, "read_cpu_pct", pre, device_snapshot(ctx, nic))
     except Exception as e:
         ctx.abort("fail", f"SMB 大文件传输失败: {e}")
     finally:
@@ -86,10 +98,15 @@ def s5_smb_seal(ctx: Ctx) -> str:
     share = smb_pick_share(ctx, host)
     p_plain = f"\\\\{host}\\{share}\\nastest_seal_plain.bin"
     p_seal = f"\\\\{host}\\{share}\\nastest_seal_enc.bin"
+    nic = device_nic(ctx)
     try:
         ctx.log("== 明文传输 ==")
+        pre = device_snapshot(ctx, nic)
         pw_ = _smb_write_mb(p_plain, mb)
+        _save_cpu(ctx, "plain_write_cpu_pct", pre, device_snapshot(ctx, nic))
+        pre = device_snapshot(ctx, nic)
         pr_, _ = _smb_read_mb(p_plain)
+        _save_cpu(ctx, "plain_read_cpu_pct", pre, device_snapshot(ctx, nic))
         ctx.log("== 加密(seal)传输 ==")
         try:
             smbclient.delete_session(host)
@@ -101,8 +118,12 @@ def s5_smb_seal(ctx: Ctx) -> str:
                                        encrypt=True)
         except Exception as e:
             ctx.abort("blocked", f"服务端不支持 SMB 加密会话: {e}")
+        pre = device_snapshot(ctx, nic)
         ew = _smb_write_mb(p_seal, mb)
+        _save_cpu(ctx, "seal_write_cpu_pct", pre, device_snapshot(ctx, nic))
+        pre = device_snapshot(ctx, nic)
         er_, _ = _smb_read_mb(p_seal)
+        _save_cpu(ctx, "seal_read_cpu_pct", pre, device_snapshot(ctx, nic))
     except CaseAbort:
         raise
     except Exception as e:
@@ -222,12 +243,16 @@ def s5_ftp(ctx: Ctx) -> str:
         if target:
             ftp.cwd(target)
             ctx.log(f"进入共享目录: {target}")
+        nic = device_nic(ctx)
         ctx.log(f"上传 {mb:.0f}MB ...")
+        pre = device_snapshot(ctx, nic)
         t0 = time.time()
         with open(src, "rb") as f:
             ftp.storbinary(f"STOR {fname}", f)
         up_s = time.time() - t0
+        _save_cpu(ctx, "upload_cpu_pct", pre, device_snapshot(ctx, nic))
         ctx.log(f"下载 {mb:.0f}MB ...")
+        pre = device_snapshot(ctx, nic)
         t0 = time.time()
         got = [0]
 
@@ -236,6 +261,7 @@ def s5_ftp(ctx: Ctx) -> str:
 
         ftp.retrbinary(f"RETR {fname}", _cnt)
         dn_s = time.time() - t0
+        _save_cpu(ctx, "download_cpu_pct", pre, device_snapshot(ctx, nic))
         ftp.delete(fname)
         ftp.quit()
     except CaseAbort:
@@ -275,14 +301,18 @@ def s5_webdav(ctx: Ctx) -> str:
     src = local_bigfile(ctx)
     mb = src.stat().st_size / 1024 / 1024
     url = f"{base}/{sub}/nastest_perf.bin"
+    nic = device_nic(ctx)
     try:
+        pre = device_snapshot(ctx, nic)
         t0 = time.time()
         with open(src, "rb") as f:
             p = httpx.put(url, content=f, auth=auth,
                           timeout=httpx.Timeout(30.0, read=600.0, write=600.0))
         up_s = time.time() - t0
+        _save_cpu(ctx, "upload_cpu_pct", pre, device_snapshot(ctx, nic))
         if p.status_code not in (200, 201, 204):
             ctx.abort("fail", f"WebDAV PUT 失败: HTTP {p.status_code}")
+        pre = device_snapshot(ctx, nic)
         t0 = time.time()
         got = 0
         with httpx.stream("GET", url, auth=auth,
@@ -292,6 +322,7 @@ def s5_webdav(ctx: Ctx) -> str:
             for chunk in r.iter_bytes(1024 * 1024):
                 got += len(chunk)
         dn_s = time.time() - t0
+        _save_cpu(ctx, "download_cpu_pct", pre, device_snapshot(ctx, nic))
         httpx.delete(url, auth=auth, timeout=60)
     except CaseAbort:
         raise
@@ -329,12 +360,15 @@ def s5_rsync(ctx: Ctx) -> str:
             "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
             f"{src}/", f"{user}@{ip}:{tdir}/rsync_dst/"]
     ctx.log(f"$ sshpass -p *** rsync -a --stats {src}/ {user}@{ip}:{tdir}/rsync_dst/")
+    nic = device_nic(ctx)
+    pre = device_snapshot(ctx, nic)
     t0 = time.time()
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
     except subprocess.TimeoutExpired:
         ctx.abort("fail", "rsync 超时")
     dur = time.time() - t0
+    _save_cpu(ctx, "rsync_cpu_pct", pre, device_snapshot(ctx, nic))
     ctx.log(p.stdout[-3000:] if p.stdout else "")
     if p.returncode != 0:
         ctx.abort("fail", f"rsync 失败 rc={p.returncode}: {p.stderr.strip()[:300]}")

@@ -61,14 +61,14 @@ def s3_seq_read(ctx: Ctx) -> str:
     _verify_raid_group(ctx)
     m = fio_profile(ctx, "seq_read")
     return (f"顺序读 1M QD32×4: {m.get('r_mbps')}MB/s (单轮值 {m.get('seq_read_r_mbps_rounds')}),"
-            f" CPU(fio) {m.get('fio_cpu_pct')}%")
+            f" CPU(整机) {m.get('dev_cpu_pct')}%")
 
 
 @_impl("s3_seq_write")
 def s3_seq_write(ctx: Ctx) -> str:
     _verify_raid_group(ctx)
     m = fio_profile(ctx, "seq_write")
-    return (f"顺序写 1M QD32×4: {m.get('w_mbps')}MB/s,CPU(fio) {m.get('fio_cpu_pct')}%"
+    return (f"顺序写 1M QD32×4: {m.get('w_mbps')}MB/s,CPU(整机) {m.get('dev_cpu_pct')}%"
             f"(RAID 写含奇偶校验开销,关注 CPU 是否瓶颈)")
 
 
