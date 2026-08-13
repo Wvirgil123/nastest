@@ -11,6 +11,7 @@ import traceback
 from . import config, db, evidence
 from .caseimpl import IMPL, CaseAbort, Ctx
 from .ctx import resolve_storage_cfg
+from .raid import RAID_SUBS
 from .registry import BY_ID, CASES, MANUAL_IDS
 from .sshc import SSH, SSHError
 
@@ -43,9 +44,12 @@ def drop_executor(run_id: int) -> None:
 
 
 def ordered_auto_ids() -> list[str]:
+    """自动阶段执行顺序。S3 的 RAID 子组(RAID0/1/5/6/10)不进入自动阶段——
+    需人工切换阵列后在对应子组点「顺序运行」,防止阵列级别与用例组不符。"""
     ids: list[str] = []
     for dom in config.DOMAIN_ORDER:
-        ids += [c.id for c in CASES if c.domain == dom and c.mode == "auto"]
+        ids += [c.id for c in CASES
+                if c.domain == dom and c.mode == "auto" and c.sub not in RAID_SUBS]
     return ids
 
 
@@ -139,10 +143,12 @@ class Executor:
         else:
             self.run_case_sync(case_id)
 
-    # ================= 域顺序运行(每域「运行」按钮) =================
-    def domain_plan(self, domain: str) -> tuple[list[str], list[dict]]:
+    # ================= 域/子组顺序运行(每域「运行」按钮;S3 按子组) =================
+    def domain_plan(self, domain: str, sub: str | None = None
+                    ) -> tuple[list[str], list[dict]]:
         """规划某域的顺序运行。返回 (queued_ids, skipped[{id,title,reason}])。
 
+        sub 用于 S3 子组(basic/RAID0/1/5/6/10),只排该子组的用例。
         跳过:正在运行的用例、hazard=critical(必须单独输入编号确认)、
         纯人工用例(无 impl,按指导提交判定)。
         """
@@ -150,6 +156,8 @@ class Executor:
         skipped: list[dict] = []
         for c in CASES:
             if c.domain != domain:
+                continue
+            if sub is not None and c.sub != sub:
                 continue
             res = db.get_result(self.run_id, c.id)
             if res and res["status"] == "running":
@@ -164,9 +172,10 @@ class Executor:
                 queued.append(c.id)
         return queued, skipped
 
-    def run_domain(self, domain: str) -> tuple[list[str], list[dict]]:
-        """后台线程依次执行域内所有可执行子测试。返回 (queued, skipped)。"""
-        queued, skipped = self.domain_plan(domain)
+    def run_domain(self, domain: str, sub: str | None = None
+                   ) -> tuple[list[str], list[dict]]:
+        """后台线程依次执行域(或 S3 子组)内所有可执行子测试。返回 (queued, skipped)。"""
+        queued, skipped = self.domain_plan(domain, sub)
         if not queued:
             return queued, skipped
         run = db.get_run(self.run_id)

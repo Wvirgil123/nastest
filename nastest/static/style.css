@@ -92,6 +92,9 @@ h3 { margin: 12px 0 8px; }
 .domain { margin-bottom: 20px; }
 .domain-title { margin-bottom: 4px; font-size: 15px; }
 .domain-title .domain-run { margin-left: 10px; vertical-align: middle; }
+.subgroup { margin: 12px 0 16px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.subgroup-title { margin: 0 0 6px; font-size: 13.5px; }
+.subgroup-title .domain-run { margin-left: 10px; vertical-align: middle; }
 .legend { margin-bottom: 8px; }
 
 .progress-wrap { margin-top: 10px; }

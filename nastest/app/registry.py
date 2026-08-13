@@ -25,15 +25,75 @@ class Case:
     deps: list[str] = field(default_factory=list)
     timeout: int = 600
     tier: str = "peak"       # peak / sustained / breaking
+    sub: str = ""            # S3 子组:basic / RAID0 / RAID1 / RAID5 / RAID6 / RAID10
 
 
 def _c(**kw) -> Case:
     return Case(**kw)
 
 
-# S3 各用例按检测到的 RAID 级别累计结果;人工重建阵列后重跑即可对比多种 RAID
-_RAID_NOTE = (";自动识别当前 RAID 级别(RAID0/1/5/6/10)并按级别累计,"
-              "人工重建阵列后重跑本项即可加入新 RAID 的对比数据")
+# ---------------- S3 存储子系统:按 RAID 形态拆子组 ----------------
+# basic 组与 RAID 级别无关;RAID0/1/5/6/10 五组为同一套存储基准(fio 矩阵 + 元数据),
+# 人工切换阵列后运行对应组即可,执行前自动校验阵列级别,级别不符会拒跑防止数据串组。
+_S3_RAID_LEVELS = ["RAID0", "RAID1", "RAID5", "RAID6", "RAID10"]
+
+# (序号, impl 键, 标题, 测试方法, 记录指标/判读)
+_S3_GROUP_TEMPLATES = [
+    ("01", "s3_seq_read", "顺序读 1M QD32×4(峰值读)",
+     "fio rw=read bs=1M iodepth=32 numjobs=4 direct=1,热身+rounds 轮取中位数",
+     "记录 MB/s、CPU%;文件>内存且 direct=1(§3.3)"),
+    ("02", "s3_seq_write", "顺序写 1M QD32×4(峰值写)",
+     "fio rw=write bs=1M iodepth=32 numjobs=4 direct=1",
+     "记录 MB/s、CPU%;RAID 写含奇偶校验开销,观察 CPU 是否瓶颈"),
+    ("03", "s3_rand_read", "4K 随机读 QD32×4(IOPS)",
+     "fio rw=randread bs=4k iodepth=32 numjobs=4 direct=1",
+     "记录 IOPS、平均/P99 延迟"),
+    ("04", "s3_rand_write", "4K 随机写 QD32×4(IOPS)",
+     "fio rw=randwrite bs=4k iodepth=32 numjobs=4 direct=1",
+     "记录 IOPS、平均/P99 延迟"),
+    ("05", "s3_randrw", "4K 混合读写 70/30 QD64×4",
+     "fio rw=randrw rwmixread=70 bs=4k iodepth=64 numjobs=4 direct=1,"
+     "percentile_list=50:90:99:99.9",
+     "记录混合 IOPS 与 P50/P90/P99/P99.9 延迟(典型负载)"),
+    ("06", "s3_qd1_lat", "4K 随机读 QD1 最低延迟",
+     "fio rw=randread bs=4k iodepth=1 numjobs=1 direct=1",
+     "记录 QD1 延迟(μs),单路径极限"),
+    ("07", "s3_fsync_lat", "fsync 提交延迟(数据库类)",
+     "fio rw=write bs=4k iodepth=1 fsync=1 direct=1",
+     "记录 fsync 延迟(μs),数据库类负载关键指标"),
+    ("08", "s3_metadata", "元数据与小文件",
+     "脚本计时:1 万文件 create/stat/read/delete(mdtest 无包,自研等价脚本)",
+     "记录各阶段 files/s;小文件 IOPS 远低裸盘→FS/RAID 元数据开销(§8 红旗)"),
+]
+
+
+def _s3_cases() -> list[Case]:
+    out: list[Case] = [
+        _c(id="S3-BASE-01", domain="S3", sub="basic",
+           title="裸盘读基线(定位层损耗)", mode="auto", impl="s3_raw_read",
+           hazard="warning", timeout=3600,
+           steps="自动识别 md 成员盘,fio 只读测试(read 不写盘,安全);与 RAID 级别无关,测一次即可",
+           expected="记录单裸盘顺序读 MB/s;用于计算 FS 层损耗与 RAID 效率(§5.3)"),
+        _c(id="S3-BASE-02", domain="S3", sub="basic",
+           title="RAID 重建速度与 IO 衰减", mode="manual", impl="s3_rebuild_monitor",
+           hazard="critical", timeout=14400,
+           steps="拔盘触发降级→(可选插回/换盘)触发重建;框架轮询 /proc/mdstat 记录速度曲线,"
+                 "重建中叠加 fio 测业务 IO 衰减",
+           expected="记录重建时长/速度(MB/s)、重建期间业务 IO 衰减%(§8:<30% 优)",
+           guide="1. 确认 RAID 为 RAID1/5/6(可降级);准备承受降级风险;\n"
+                 "2. 点击\"运行\"前从设备拔出一块成员盘(或 sudo mdadm --fail + --remove);\n"
+                 "3. 点击\"运行\":框架确认降级后,插回/更换硬盘触发重建并全程监控;\n"
+                 "4. 重建期间框架自动叠加 fio 负载测衰减;重建完成后自动结束。"),
+    ]
+    for lv in _S3_RAID_LEVELS:
+        for n, impl, title, steps, expected in _S3_GROUP_TEMPLATES:
+            out.append(_c(
+                id=f"S3-{lv}-{n}", domain="S3", sub=lv, title=title, mode="auto",
+                impl=impl, timeout=1800 if n == "08" else 3600,
+                steps=steps + f";属于 {lv} 组:把阵列切换为 {lv} 后点本组「▶ 顺序运行本组」批量执行,"
+                              "执行前自动校验阵列级别,不符会拒跑",
+                expected=expected))
+    return out
 
 
 CASES: list[Case] = [
@@ -75,45 +135,8 @@ CASES: list[Case] = [
        steps="sysbench memory 1M 块全核带宽 + 4K 随机访问延迟",
        expected="记录 MiB/s 与随机延迟;与 STREAM 交叉验证"),
 
-    # ================= S3 存储子系统(方案 §5.3) =================
-    _c(id="S3-01", domain="S3", title="顺序读 1M QD32×4(峰值读)", mode="auto", impl="s3_seq_read",
-       steps="fio rw=read bs=1M iodepth=32 numjobs=4 direct=1,热身+rounds 轮取中位数" + _RAID_NOTE,
-       expected="记录 MB/s、CPU%;文件>内存且 direct=1(§3.3)", timeout=3600),
-    _c(id="S3-02", domain="S3", title="顺序写 1M QD32×4(峰值写)", mode="auto", impl="s3_seq_write",
-       steps="fio rw=write bs=1M iodepth=32 numjobs=4 direct=1" + _RAID_NOTE,
-       expected="记录 MB/s、CPU%;RAID 写含奇偶校验开销,观察 CPU 是否瓶颈", timeout=3600),
-    _c(id="S3-03", domain="S3", title="4K 随机读 QD32×4(IOPS)", mode="auto", impl="s3_rand_read",
-       steps="fio rw=randread bs=4k iodepth=32 numjobs=4 direct=1" + _RAID_NOTE,
-       expected="记录 IOPS、平均/P99 延迟", timeout=3600),
-    _c(id="S3-04", domain="S3", title="4K 随机写 QD32×4(IOPS)", mode="auto", impl="s3_rand_write",
-       steps="fio rw=randwrite bs=4k iodepth=32 numjobs=4 direct=1" + _RAID_NOTE,
-       expected="记录 IOPS、平均/P99 延迟", timeout=3600),
-    _c(id="S3-05", domain="S3", title="4K 混合读写 70/30 QD64×4", mode="auto", impl="s3_randrw",
-       steps="fio rw=randrw rwmixread=70 bs=4k iodepth=64 numjobs=4 direct=1,"
-             "percentile_list=50:90:99:99.9" + _RAID_NOTE,
-       expected="记录混合 IOPS 与 P50/P90/P99/P99.9 延迟(典型负载)", timeout=3600),
-    _c(id="S3-06", domain="S3", title="4K 随机读 QD1 最低延迟", mode="auto", impl="s3_qd1_lat",
-       steps="fio rw=randread bs=4k iodepth=1 numjobs=1 direct=1" + _RAID_NOTE,
-       expected="记录 QD1 延迟(μs),单路径极限", timeout=3600),
-    _c(id="S3-07", domain="S3", title="fsync 提交延迟(数据库类)", mode="auto", impl="s3_fsync_lat",
-       steps="fio rw=write bs=4k iodepth=1 fsync=1 direct=1" + _RAID_NOTE,
-       expected="记录 fsync 延迟(μs),数据库类负载关键指标", timeout=3600),
-    _c(id="S3-08", domain="S3", title="元数据与小文件", mode="auto", impl="s3_metadata",
-       steps="脚本计时:1 万文件 create/stat/read/delete(mdtest 无包,自研等价脚本)" + _RAID_NOTE,
-       expected="记录各阶段 files/s;小文件 IOPS 远低裸盘→FS/RAID 元数据开销(§8 红旗)", timeout=1800),
-    _c(id="S3-09", domain="S3", title="裸盘读基线(定位层损耗)", mode="auto", impl="s3_raw_read",
-       hazard="warning",
-       steps="自动识别 md 成员盘,fio 只读测试(read 不写盘,安全)" + _RAID_NOTE,
-       expected="记录单裸盘顺序读 MB/s;用于计算 FS 层损耗与 RAID 效率(§5.3)", timeout=3600),
-    _c(id="S3-10", domain="S3", title="RAID 重建速度与 IO 衰减", mode="manual", impl="s3_rebuild_monitor",
-       hazard="critical", timeout=14400,
-       steps="拔盘触发降级→(可选插回/换盘)触发重建;框架轮询 /proc/mdstat 记录速度曲线,"
-             "重建中叠加 fio 测业务 IO 衰减",
-       expected="记录重建时长/速度(MB/s)、重建期间业务 IO 衰减%(§8:<30% 优)",
-       guide="1. 确认 RAID 为 RAID1/5/6(可降级);准备承受降级风险;\n"
-             "2. 点击\"运行\"前从设备拔出一块成员盘(或 sudo mdadm --fail + --remove);\n"
-             "3. 点击\"运行\":框架确认降级后,插回/更换硬盘触发重建并全程监控;\n"
-             "4. 重建期间框架自动叠加 fio 负载测衰减;重建完成后自动结束。"),
+    # ================= S3 存储子系统(方案 §5.3)— basic + RAID0/1/5/6/10 六子组 =================
+    *_s3_cases(),
 
     # ================= S4 网络层(方案 §5.4) =================
     _c(id="S4-01", domain="S4", title="TCP 单流上行(客户端→NAS)", mode="auto", impl="s4_tcp_tx",
@@ -212,7 +235,7 @@ CASES: list[Case] = [
        steps="卷填充至 ≥90% 后重测顺序写与 4K 随机写,对比空卷",
        expected="记录衰减%(§8:<10% 优);机械盘内圈/btrfs 分配/SSD GC 都会体现",
        guide="1. 点击\"运行\"后框架会用 dd/fallocate 将卷填充到目标占比(默认 90%),耗时较长请确认磁盘空间无他用;\n"
-             "2. 填充完成后自动复测 S3-02/S3-04 同参数并对比;\n"
+             "2. 填充完成后自动复测当前 RAID 组的顺序写/随机写同参数并对比;\n"
              "3. 测试结束后框架清理填充文件;若不想自动填充,可手动填满后在备注录入前后数据提交判定。"),
     _c(id="S8-04", domain="S8", title="异常断电恢复", mode="manual",
        tier="breaking", hazard="critical",
@@ -229,7 +252,7 @@ CASES: list[Case] = [
        expected="记录各状态瓦数;能效=吞吐(MB/s)÷整机功耗(W)——ARM NAS 核心卖点,必须量化",
        guide="1. 将设备接入计量插座(功率计);\n"
              "2. 空闲:等待硬盘休眠后 10 分钟读数;盘转空闲:盘转无 IO;\n"
-             "3. 单维满载:可分别点击运行 S1-01(CPU)/S3-02(IO)/S4-01(网络)时读数;\n"
+             "3. 单维满载:可分别点击运行 S1-01(CPU)/S3 RAID 组顺序写(IO)/S4-01(网络)时读数;\n"
              "4. 综合满载:S8-01 浸泡期间读数;\n"
              "5. 在下方\"录入读数\"表单填入各状态瓦数,框架自动计算 MB/s/W。"),
 ]

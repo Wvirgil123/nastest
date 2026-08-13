@@ -124,6 +124,11 @@ def list_results(run_id: int) -> list[dict]:
     return out
 
 
+def delete_result(run_id: int, case_id: str) -> None:
+    with _conn() as c:
+        c.execute("DELETE FROM results WHERE run_id=? AND case_id=?", (run_id, case_id))
+
+
 def get_result(run_id: int, case_id: str) -> dict | None:
     with _conn() as c:
         row = c.execute(

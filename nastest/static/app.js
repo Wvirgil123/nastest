@@ -9,7 +9,17 @@ const CASE_BY_ID = Object.fromEntries(CASES.map(c => [c.id, c]));
 const METRIC_FORMS = {
   'S9-01': [['watts_idle', '空闲功率(W)'], ['watts_disk_idle', '盘转空闲功率(W)'],
             ['watts_single', '单维满载功率(W)'], ['watts_full', '综合满载功率(W)']],
-  'S3-10': [['rebuild_io_degrade_pct', '重建期间业务 IO 衰减(%)']],
+  'S3-BASE-02': [['rebuild_io_degrade_pct', '重建期间业务 IO 衰减(%)']],
+};
+// S3 六个子组:basic + 五种 RAID 级别(人工切换阵列后运行对应组)
+const S3_SUBS = ['basic', 'RAID0', 'RAID1', 'RAID5', 'RAID6', 'RAID10'];
+const S3_SUB_DESC = {
+  basic: '与 RAID 级别无关:裸盘读基线 + RAID 重建监控',
+  RAID0: '条带 · 无冗余,峰值读写',
+  RAID1: '镜像 · 读可并行,写=单盘',
+  RAID5: '分布式奇偶校验 · ≥3 盘,允许坏 1 盘',
+  RAID6: '双奇偶校验 · ≥4 盘,允许坏 2 盘',
+  RAID10: '镜像+条带 · ≥4 盘,高 IOPS',
 };
 let STATE = null;
 let OPEN_CASE = null;
@@ -46,6 +56,20 @@ const fmt = (v, u = '') => (v === undefined || v === null) ? '—' : v + u;
 
 function keyMetric(c, m) {
   if (!m) return '';
+  // S3 RAID 子组:同一套 fio 矩阵,指标键相同,按组内序号区分
+  if (c.id.startsWith('S3-RAID')) {
+    switch (c.id.slice(-2)) {
+      case '01': return fmt(m.seq_read_r_mbps, 'MB/s');
+      case '02': return fmt(m.seq_write_w_mbps, 'MB/s');
+      case '03': return fmt(m.rand_read_r_iops, ' IOPS');
+      case '04': return fmt(m.rand_write_w_iops, ' IOPS');
+      case '05': return `混合 ${fmt(m.randrw_mixed_iops, ' IOPS')}`;
+      case '06': return fmt(m.qd1_lat_r_lat_us, 'μs');
+      case '07': return `fsync ${fmt(m.fsync_lat_fsync_lat_us, 'μs')}`;
+      case '08': return `create ${fmt(m.files_s_create)} files/s`;
+    }
+    return '';
+  }
   switch (c.id) {
     case 'S1-01': return `单核 ${fmt(m.cpu_events_s_single)} / 多核 ${fmt(m.cpu_events_s_multi)} ev/s`;
     case 'S1-02': return `AES-128-GCM ${fmt(m['openssl_aes-128-gcm_mb_s'], 'MB/s')}`;
@@ -53,16 +77,8 @@ function keyMetric(c, m) {
     case 'S1-04': return `单核 ${fmt(m.coremark_single)} / 多核 ${fmt(m.coremark_multi)}`;
     case 'S2-01': return `Triad ${fmt(m.stream_triad_gb_s, 'GB/s')}`;
     case 'S2-02': return fmt(m.mem_bw_mib_s, 'MiB/s');
-    case 'S3-01': return fmt(m.seq_read_r_mbps, 'MB/s');
-    case 'S3-02': return fmt(m.seq_write_w_mbps, 'MB/s');
-    case 'S3-03': return fmt(m.rand_read_r_iops, ' IOPS');
-    case 'S3-04': return fmt(m.rand_write_w_iops, ' IOPS');
-    case 'S3-05': return `混合 ${fmt(m.randrw_mixed_iops, ' IOPS')}`;
-    case 'S3-06': return fmt(m.qd1_lat_r_lat_us, 'μs');
-    case 'S3-07': return `fsync ${fmt(m.fsync_lat_fsync_lat_us, 'μs')}`;
-    case 'S3-08': return `create ${fmt(m.files_s_create)} files/s`;
-    case 'S3-09': return fmt(m.raw_read_mb_s, 'MB/s');
-    case 'S3-10': return `${fmt(m.rebuild_minutes, 'min')} ${fmt(m.rebuild_avg_speed_mb_s, 'MB/s')}`;
+    case 'S3-BASE-01': return fmt(m.raw_read_mb_s, 'MB/s');
+    case 'S3-BASE-02': return `${fmt(m.rebuild_minutes, 'min')} ${fmt(m.rebuild_avg_speed_mb_s, 'MB/s')}`;
     case 'S4-01': return `${fmt(m.tcp_tx_mbps, 'Mbps')} 利用率 ${fmt(m.link_util_pct, '%')}`;
     case 'S4-02': return fmt(m.tcp_rx_mbps, 'Mbps');
     case 'S4-03': return fmt(m.tcp_multi_mbps, 'Mbps');
@@ -90,37 +106,70 @@ function keyMetric(c, m) {
 }
 
 // ---------- 初始化 ----------
+function caseRow(c) {
+  const tr = el('tr');
+  tr.id = 'row-' + c.id;
+  tr.innerHTML = `
+    <td class="mono">${c.id}</td>
+    <td>${c.hazard === 'critical' ? '<span class="hazard" title="高危:需输入编号确认">⚠</span>' : ''}${esc(c.title)}</td>
+    <td class="small" title="${c.tier}">${TIER_TXT[c.tier] || ''}</td>
+    <td class="small">${c.mode === 'auto' ? '自动' : (c.has_impl ? '人工+校验' : '纯人工')}</td>
+    <td id="st-${c.id}" class="small">⬜ 未测</td>
+    <td id="km-${c.id}" class="small mono"></td>
+    <td id="op-${c.id}"></td>`;
+  tr.addEventListener('click', (ev) => { if (!ev.target.closest('button')) openCase(c.id); });
+  return tr;
+}
+
+const CASE_THEAD = '<thead><tr><th style="width:110px">编号</th><th>测试项</th><th style="width:40px">层次</th><th style="width:80px">方式</th><th style="width:100px">状态</th><th style="width:230px">关键指标</th><th style="width:150px">操作</th></tr></thead>';
+
 function buildDomains() {
   const wrap = document.getElementById('domains');
   wrap.innerHTML = '';
   for (const dom of DOMAIN_ORDER) {
     const sec = el('div', 'domain');
+    if (dom === 'S3') { buildS3(sec); wrap.appendChild(sec); continue; }
     sec.innerHTML = `<h3 class="domain-title" id="dt-${dom}">${dom} ${esc(DOMAIN_NAMES[dom])} <span class="muted small" id="ds-${dom}"></span></h3>`;
     const dbtn = el('button', 'btn btn-sm domain-run', '▶ 顺序运行本域');
     dbtn.title = '依次运行本域所有子测试(自动跳过:高危项/纯人工项/运行中的项)';
     dbtn.onclick = () => runDomain(dom);
     sec.querySelector('.domain-title').appendChild(dbtn);
     const tbl = el('table', 'table case-table');
-    tbl.innerHTML = '<thead><tr><th style="width:64px">编号</th><th>测试项</th><th style="width:40px">层次</th><th style="width:80px">方式</th><th style="width:100px">状态</th><th style="width:230px">关键指标</th><th style="width:150px">操作</th></tr></thead>';
+    tbl.innerHTML = CASE_THEAD;
     const tb = el('tbody');
     tb.id = 'tb-' + dom;
-    for (const c of CASES.filter(x => x.domain === dom)) {
-      const tr = el('tr');
-      tr.id = 'row-' + c.id;
-      tr.innerHTML = `
-        <td class="mono">${c.id}</td>
-        <td>${c.hazard === 'critical' ? '<span class="hazard" title="高危:需输入编号确认">⚠</span>' : ''}${esc(c.title)}</td>
-        <td class="small" title="${c.tier}">${TIER_TXT[c.tier] || ''}</td>
-        <td class="small">${c.mode === 'auto' ? '自动' : (c.has_impl ? '人工+校验' : '纯人工')}</td>
-        <td id="st-${c.id}" class="small">⬜ 未测</td>
-        <td id="km-${c.id}" class="small mono"></td>
-        <td id="op-${c.id}"></td>`;
-      tr.addEventListener('click', (ev) => { if (!ev.target.closest('button')) openCase(c.id); });
-      tb.appendChild(tr);
-    }
+    for (const c of CASES.filter(x => x.domain === dom)) tb.appendChild(caseRow(c));
     tbl.appendChild(tb);
     sec.appendChild(tbl);
     wrap.appendChild(sec);
+  }
+}
+
+// S3 按子组渲染:basic + RAID0/1/5/6/10,每组一个独立「顺序运行」按钮
+function buildS3(sec) {
+  sec.innerHTML = `<h3 class="domain-title" id="dt-S3">S3 ${esc(DOMAIN_NAMES['S3'])} <span class="muted small" id="ds-S3"></span></h3>
+    <div class="banner-info small">S3 按 RAID 子组运行:把设备阵列切换为对应 RAID 级别后,点该组的「▶ 顺序运行本组」。
+    执行前框架自动校验 <span class="mono">/proc/mdstat</span> 阵列级别,与组不符会拒跑(防止数据串组);basic 组与 RAID 级别无关。</div>`;
+  for (const sub of S3_SUBS) {
+    const box = el('div', 'subgroup');
+    const label = sub === 'basic' ? 'basic(公共基线)' : `${sub} 组`;
+    box.innerHTML = `<h4 class="subgroup-title">${label}
+      <span class="muted small">${esc(S3_SUB_DESC[sub] || '')}</span>
+      <span class="muted small" id="ss-${sub}"></span></h4>`;
+    const btn = el('button', 'btn btn-sm domain-run', '▶ 顺序运行本组');
+    btn.title = sub === 'basic'
+      ? '运行 basic 组可自动执行的用例(裸盘读基线)'
+      : `确认阵列已切换为 ${sub} 后点击,依次运行本组全部用例(执行前自动校验阵列级别)`;
+    btn.onclick = () => runSub(sub);
+    box.querySelector('.subgroup-title').appendChild(btn);
+    const tbl = el('table', 'table case-table');
+    tbl.innerHTML = CASE_THEAD;
+    const tb = el('tbody');
+    tb.id = 'tb-S3-' + sub;
+    for (const c of CASES.filter(x => x.domain === 'S3' && x.sub === sub)) tb.appendChild(caseRow(c));
+    tbl.appendChild(tb);
+    box.appendChild(tbl);
+    sec.appendChild(box);
   }
 }
 
@@ -176,7 +225,7 @@ function renderControls() {
     mb.innerHTML = STATE.manual_done
       ? '🎉 人工用例已全部判定,可生成测试报告。'
       : `🙋 自动阶段结束。剩余人工用例 ${c.manual_pending || 0} 条:点击用例行查看操作指导,完成后提交判定` +
-        `(S9-01 功率、S3-10 重建衰减可在详情中录入数值;无法完成的项可标记"跳过"并说明)。`;
+        `(S9-01 功率、S3-BASE-02 重建衰减可在详情中录入数值;无法完成的项可标记"跳过"并说明)。`;
   } else mb.style.display = 'none';
 }
 
@@ -237,6 +286,7 @@ function renderPreflight() {
 function renderCases() {
   const byId = Object.fromEntries(STATE.results.map(r => [r.case_id, r]));
   const domStats = {};
+  const subStats = {};
   for (const c of CASES) {
     const r = byId[c.id] || {status: 'pending'};
     document.getElementById('st-' + c.id).innerHTML = STATUS_TXT[r.status] || r.status;
@@ -261,19 +311,27 @@ function renderCases() {
     domStats[c.domain].total++;
     if (r.status === 'pass') domStats[c.domain].pass++;
     if (r.status === 'fail') domStats[c.domain].fail++;
+    if (c.domain === 'S3' && c.sub) {
+      subStats[c.sub] = subStats[c.sub] || {pass: 0, fail: 0, total: 0};
+      subStats[c.sub].total++;
+      if (r.status === 'pass') subStats[c.sub].pass++;
+      if (r.status === 'fail') subStats[c.sub].fail++;
+    }
   }
   for (const dom of DOMAIN_ORDER) {
     const s = domStats[dom];
     if (s) document.getElementById('ds-' + dom).textContent = `(${s.pass}完成 / ${s.fail}失败 / ${s.total}项)`;
   }
-  // S3:显示已累计的 RAID 级别(人工重建阵列重跑后逐级叠加)
-  const lvSet = new Set();
-  for (const r of STATE.results) {
-    if (!r.case_id.startsWith('S3')) continue;
-    for (const lv of (r.metrics && r.metrics.raid_levels_tested) || []) lvSet.add(lv);
+  // S3:各子组进度 + 已有数据的组(报告中按组出子表)
+  const tested = [];
+  for (const sub of S3_SUBS) {
+    const s = subStats[sub];
+    const tag = document.getElementById('ss-' + sub);
+    if (s && tag) tag.textContent = `(${s.pass}完成 / ${s.fail}失败 / ${s.total}项)`;
+    if (s && s.pass > 0) tested.push(sub === 'basic' ? 'basic' : sub);
   }
   const ds3 = document.getElementById('ds-S3');
-  if (ds3 && lvSet.size) ds3.textContent += ` · 已测 RAID: ${[...lvSet].join(' / ')}`;
+  if (ds3 && tested.length) ds3.textContent += ` · 已测组: ${tested.join(' / ')}`;
 }
 
 async function refresh() {
@@ -357,6 +415,21 @@ async function runDomain(dom) {
   } catch (e) { alert(e.message); }
 }
 
+// S3 子组顺序运行(basic / RAID0/1/5/6/10),执行前逐用例自动校验阵列级别
+async function runSub(sub) {
+  const tip = sub === 'basic' ? '' : `\n\n请确认设备阵列当前已是 ${sub}(不符的用例将被拒跑)。`;
+  if (!confirm(`将顺序运行 S3 ${sub} 组的全部可执行用例。${tip}`)) return;
+  try {
+    const r = await api(`/api/runs/${RUN_ID}/domains/S3/run`, 'POST', {sub});
+    const parts = [`▶ S3 ${sub} 组顺序运行已启动:共 ${r.queued.length} 项(${r.queued.join('、') || '无可执行项'})`];
+    if (r.skipped && r.skipped.length) {
+      parts.push(`跳过 ${r.skipped.length} 项:` + r.skipped.map(s => `${s.id}(${s.reason})`).join(';'));
+    }
+    alert(parts.join('\n'));
+    refresh();
+  } catch (e) { alert(e.message); }
+}
+
 // ---------- 用例详情弹窗 ----------
 function openCase(cid) { OPEN_CASE = cid; renderModal(); document.getElementById('modal-mask').style.display = 'flex'; }
 function closeModal() {
@@ -385,7 +458,7 @@ function renderModal() {
         `<tr><td class="mono">${esc(k)}</td><td class="mono">${esc(typeof v === 'object' ? JSON.stringify(v) : v)}</td></tr>`).join('') +
       '</table></div>';
   }
-  // 人工数值录入(S9-01 功耗 / S3-10 重建衰减)
+  // 人工数值录入(S9-01 功耗 / S3-BASE-02 重建衰减)
   if (METRIC_FORMS[c.id]) {
     html += `<div class="kv"><b>🔢 数值录入(保存后可运行校验/参与评级)</b><div class="grid2">` +
       METRIC_FORMS[c.id].map(([k, label]) =>

@@ -8,7 +8,7 @@ import csv
 import time
 from pathlib import Path
 
-from . import config, db, evidence
+from . import config, db, evidence, raid
 from .registry import BY_ID, CASES
 from .scorer import score_run
 
@@ -21,8 +21,20 @@ TIER_CN = {"peak": "峰值", "sustained": "持续", "breaking": "极限容量"}
 # RAID 细分展示顺序
 RAID_ORDER = ["RAID0", "RAID1", "RAID5", "RAID6", "RAID10"]
 
-# (用例, 负载名, bs/QD/jobs, 前缀, 主方向 r/w/mixed)
+# 新版子组表:(组内序号, 负载名, bs/QD/jobs, 指标前缀, 主方向 r/w/mixed)
+# 用例编号 = S3-<RAID级别>-<序号>,扁平指标键,级别随组名携带
 _STORAGE_ROWS = [
+    ("01", "顺序读", "1M / QD32 / 4jobs", "seq_read", "r"),
+    ("02", "顺序写", "1M / QD32 / 4jobs", "seq_write", "w"),
+    ("03", "4K 随机读", "4K / QD32 / 4jobs", "rand_read", "r"),
+    ("04", "4K 随机写", "4K / QD32 / 4jobs", "rand_write", "w"),
+    ("05", "4K 混合 70/30", "4K / QD64 / 4jobs", "randrw", "mixed"),
+    ("06", "4K 随读 QD1 延迟", "4K / QD1 / 1job", "qd1_lat", "r"),
+    ("07", "4K 写+fsync 延迟", "4K / QD1 / 1job", "fsync_lat", "w"),
+]
+
+# 旧编号(仅未迁移数据兜底;启动迁移正常时不会触发)
+_LEGACY_ROWS = [
     ("S3-01", "顺序读", "1M / QD32 / 4jobs", "seq_read", "r"),
     ("S3-02", "顺序写", "1M / QD32 / 4jobs", "seq_write", "w"),
     ("S3-03", "4K 随机读", "4K / QD32 / 4jobs", "rand_read", "r"),
@@ -101,39 +113,50 @@ def _storage_row(m: dict, cid: str, name: str, spec: str, prefix: str,
 
 
 def storage_table(results: dict, cfg: dict) -> dict:
-    """存储子系统表,按 RAID 级别分组(RAID0/1/5/6/10 细分对比)。
+    """存储子系统表,按 RAID 子组分组(RAID0/1/5/6/10 各自一张子表)。
 
     返回 {"multi": bool, "levels": [{"raid":…, "rows":[…]}], "hint": str}。
-    - 有 raid_<级别>_ 累计数据:每个测过的 RAID 级别一张子表;
-    - 无(旧数据/未启用):回退单一表,RAID 标签取运行配置 raid_level。
+    - 子组编号 S3-<级别>-01..08 有数据:每个测过的 RAID 级别一张子表(扁平指标);
+    - 仅存旧版 raid_<级别>_ 命名空间数据(未迁移):按旧键回退渲染;
+    - 全空:单张空表,RAID 标签取运行配置 raid_level。
     """
-    levels = _raid_levels(results) if _has_raid_keys(results) else []
+    levels = [lv for lv in RAID_ORDER
+              if any(_metrics(results, raid.level_case(lv, n))
+                     for n, *_ in _STORAGE_ROWS)]
     if levels:
         out_levels = []
         for lv in levels:
             rows = []
-            for cid, name, spec, prefix, side in _STORAGE_ROWS:
+            for n, name, spec, prefix, side in _STORAGE_ROWS:
+                cid = raid.level_case(lv, n)
+                m = _metrics(results, cid)
+                if not m:
+                    rows.append({"case_id": cid, "case": name, "spec": spec,
+                                 "raid": lv, "empty": True})
+                    continue
+                rows.append(_storage_row(m, cid, name, spec, prefix, side, lv,
+                                         lambda k, m=m: _m(m, k)))
+            out_levels.append({"raid": lv, "rows": rows})
+        return {"multi": len(out_levels) > 1, "levels": out_levels,
+                "hint": ("每个 RAID 子组一张子表。切换阵列级别后运行对应 RAID 组的"
+                         "「▶ 顺序运行本组」即可补入新 RAID 数据;执行前框架自动校验阵列级别,"
+                         "不符会拒跑(防止数据串组)。")}
+    if _has_raid_keys(results):  # 旧版 raid_<级别>_ 命名空间数据(迁移兜底)
+        out_levels = []
+        for lv in _raid_levels(results):
+            rows = []
+            for cid, name, spec, prefix, side in _LEGACY_ROWS:
                 m = _metrics(results, cid)
                 rows.append(_storage_row(
                     m, cid, name, spec, prefix, side, lv,
                     lambda k, m=m, lv=lv: _m(m, f"raid_{lv}_{k}")))
             out_levels.append({"raid": lv, "rows": rows})
-        return {"multi": True, "levels": out_levels,
-                "hint": ("RAID 对比模式:每种 RAID 一张子表。切换 RAID 方式需人工在 fnOS/系统中"
-                         "重建阵列(无法自动切换),重建后重新运行 S3-01~S3-09(或用「域顺序运行」)"
-                         "即可把新 RAID 的结果累计进来。")}
-    # 回退:单一 RAID(与旧行为一致)
-    raid = cfg.get("raid_level", "?")
-    rows = []
-    for cid, name, spec, prefix, side in _STORAGE_ROWS:
-        m = _metrics(results, cid)
-        if not m:
-            rows.append({"case_id": cid, "case": name, "spec": spec, "raid": raid,
-                         "empty": True})
-            continue
-        rows.append(_storage_row(m, cid, name, spec, prefix, side, raid,
-                                 lambda k, m=m: _m(m, k)))
-    return {"multi": False, "levels": [{"raid": raid, "rows": rows}], "hint": ""}
+        return {"multi": True, "levels": out_levels, "hint": "(旧版累计数据)"}
+    # 全空:占位单表
+    raid_lbl = str(cfg.get("raid_level") or "?")
+    rows = [{"case_id": "", "case": name, "spec": spec, "raid": raid_lbl, "empty": True}
+            for _n, name, spec, _p, _s in _STORAGE_ROWS]
+    return {"multi": False, "levels": [{"raid": raid_lbl, "rows": rows}], "hint": ""}
 
 
 def protocol_table(results: dict) -> list[dict]:
@@ -293,8 +316,9 @@ def methodology(cfg: dict) -> dict:
                 f"设备端 fio,direct=1 直通存储(绕开页缓存),单 job 测试文件 {size}(需大于物理内存,防止缓存作假);",
                 f"每个 profile 先热身 {warm}s,再正式跑 {rounds} 轮取中位数,轮间波动 >10% 自动标记可信度下降;",
                 "7 个负载画像:顺序读/写(1M 大块)、4K 随机读/写、4K 混合读写 70/30、QD1 最低延迟、fsync 提交延迟;",
-                "S3-09 自动从 /proc/mdstat 识别 RAID 成员盘做只读裸盘基线,用于换算文件系统层损耗与 RAID 效率;",
-                "S3 各用例自动识别当前 RAID 级别(RAID0/1/5/6/10)并按级别累计,人工重建阵列后重跑即可对比。",
+                "S3-BASE-01 自动从 /proc/mdstat 识别 RAID 成员盘做只读裸盘基线,用于换算文件系统层损耗与 RAID 效率;",
+                "S3 分为 basic / RAID0 / RAID1 / RAID5 / RAID6 / RAID10 子组:人工切换阵列后运行对应组,"
+                "执行前自动校验 /proc/mdstat 阵列级别,不符拒跑,防止数据串组。",
             ],
             "principle": [
                 "direct=1 + 文件>内存,确保测的是磁盘/RAID 真实性能而非内存缓存;",
@@ -303,15 +327,15 @@ def methodology(cfg: dict) -> dict:
                 "percentile(50/90/99/99.9)延迟用于暴露长尾;CPU% 用于判断算力是否先于存储成为瓶颈。",
             ],
             "commands": [
-                f"# 顺序读(S3-01),其余 profile 仅 --rw/--bs/--iodepth 不同\n"
+                f"# 顺序读(S3-<RAID级别>-01),其余 profile 仅 --rw/--bs/--iodepth 不同\n"
                 f"fio --name=seq_read --directory={tdir} --size={size} --rw=read --bs=1M "
                 f"--iodepth=32 --numjobs=4 --direct=1 --time_based --runtime={rt} "
                 f"--group_reporting --output-format=json",
-                f"# fsync 提交延迟(S3-07)\n"
+                f"# fsync 提交延迟(S3-<RAID级别>-07)\n"
                 f"fio --name=fsync_lat --directory={tdir} --size={size} --rw=write --bs=4k "
                 f"--iodepth=1 --numjobs=1 --direct=1 --fsync=1 --time_based --runtime={rt} "
                 f"--group_reporting --output-format=json",
-                f"# 裸盘读基线(S3-09,sdX 由 /proc/mdstat 自动识别,只读安全)\n"
+                f"# 裸盘读基线(S3-BASE-01,sdX 由 /proc/mdstat 自动识别,只读安全)\n"
                 f"fio --name=rawread --filename=/dev/sdX --rw=read --bs=128k "
                 f"--iodepth=32 --numjobs=1 --direct=1 --time_based --runtime={rt} --output-format=json",
             ],

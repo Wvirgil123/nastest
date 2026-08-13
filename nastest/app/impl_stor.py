@@ -18,94 +18,77 @@ def _impl(key: str):
     return deco
 
 
-# ================= S3 RAID 细分支持(RAID0/1/5/6/10) =================
-def raid_level(ctx: Ctx) -> str:
-    """识别当前阵列 RAID 级别:优先解析 /proc/mdstat,失败回退运行配置 raid_level。
-
-    fnOS/标准 mdadm 阵列均会在 mdstat 中显示 raid0/raid1/raid5/raid6/raid10。
-    """
+# ================= S3 RAID 子组校验(basic / RAID0/1/5/6/10) =================
+def detect_md_raid(ctx: Ctx) -> str | None:
+    """解析 /proc/mdstat 识别当前 md 阵列级别(RAID0/1/5/6/10);无阵列返回 None。"""
     md = ctx.sh("cat /proc/mdstat", note="识别当前 RAID 级别").out
     m = re.search(r"\braid(\d+)\b", md)          # raid10 整体贪婪匹配,不会误判为 raid1
     if m:
         return f"RAID{m.group(1)}"
-    if re.search(r"\blinear\b", md):
-        return "LINEAR"
-    lvl = str(ctx.cfg.get("raid_level") or "").strip().upper()
-    if lvl.startswith("RAID"):
-        ctx.log(f"[!] /proc/mdstat 未识别到 md 阵列(可能是 dm/硬 RAID),回退配置值 {lvl}")
-        return lvl
-    return "未知"
+    return None
 
 
-def raid_carry(ctx: Ctx) -> None:
-    """继承上一次结果中已有的 raid_* 指标,保证切换阵列重跑后历史 RAID 数据不丢。"""
-    prev = db.get_result(ctx.run_id, ctx.case_id)
-    if prev and prev.get("metrics"):
-        for k, v in prev["metrics"].items():
-            if k.startswith("raid_"):
-                ctx.metrics[k] = v
+def _verify_raid_group(ctx: Ctx) -> str | None:
+    """执行前校验阵列级别与本用例所属 RAID 组一致,防止切换阵列前后数据串组。
+
+    返回所属组名;basic 组(组名 None)不校验。检测不到 md 阵列时仅告警(可能是
+    dm/硬件 RAID),按用例所在组记录;检测到但不一致 → blocked 拒跑。
+    """
+    from .raid import raid_group_of
+    group = raid_group_of(ctx.case_id)
+    if group is None:
+        return None
+    det = detect_md_raid(ctx)
+    if det is None:
+        ctx.log(f"[!] /proc/mdstat 未识别到 md 阵列(可能是 dm/硬 RAID),"
+                f"无法自动校验,按本组 {group} 记录")
+        return group
+    if det != group:
+        ctx.abort("blocked",
+                  f"阵列级别不符:当前 /proc/mdstat 为 {det},本用例属于 {group} 组。"
+                  f"请改跑 {det} 组的用例,或把阵列切换为 {group} 后再运行本组(防止数据串组)")
+    ctx.log(f"[RAID] 校验通过:阵列级别 {det} 与本组一致")
+    return group
 
 
-def raid_record(ctx: Ctx, kv: dict) -> str:
-    """把本次测量值记录到 raid_<级别>_ 命名空间,并维护已测 RAID 级别清单。"""
-    lvl = raid_level(ctx)
-    for k, v in kv.items():
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            ctx.metric(f"raid_{lvl}_{k}", v)
-    ctx.metric("raid_level_tested", lvl)
-    levels = list(ctx.metrics.get("raid_levels_tested") or [])
-    if lvl not in levels:
-        levels.append(lvl)
-    ctx.metric("raid_levels_tested", levels)
-    ctx.log(f"[RAID] 本次结果记入 {lvl}(已测级别: {', '.join(levels)})")
-    return lvl
-
-
-# ================= S3 存储子系统(fio 矩阵) =================
-def _fio_case(ctx: Ctx, profile: str) -> dict:
-    return fio_profile(ctx, profile)
-
-
-def _fio_raid_case(ctx: Ctx, profile: str) -> tuple[dict, str]:
-    """fio 矩阵通用流程:继承历史 RAID 数据 → 跑 profile → 按当前 RAID 级别累计。"""
-    raid_carry(ctx)
-    m = _fio_case(ctx, profile)
-    lvl = raid_record(ctx, {f"{profile}_{k}": v for k, v in m.items()})
-    return m, lvl
-
-
+# ================= S3 存储子系统(fio 矩阵,扁平指标,级别由用例编号携带) =================
 @_impl("s3_seq_read")
 def s3_seq_read(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "seq_read")
-    return (f"[{lvl}] 顺序读 1M QD32×4: {m.get('r_mbps')}MB/s (单轮值 {m.get('seq_read_r_mbps_rounds')}),"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "seq_read")
+    return (f"顺序读 1M QD32×4: {m.get('r_mbps')}MB/s (单轮值 {m.get('seq_read_r_mbps_rounds')}),"
             f" CPU(fio) {m.get('fio_cpu_pct')}%")
 
 
 @_impl("s3_seq_write")
 def s3_seq_write(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "seq_write")
-    return (f"[{lvl}] 顺序写 1M QD32×4: {m.get('w_mbps')}MB/s,CPU(fio) {m.get('fio_cpu_pct')}%"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "seq_write")
+    return (f"顺序写 1M QD32×4: {m.get('w_mbps')}MB/s,CPU(fio) {m.get('fio_cpu_pct')}%"
             f"(RAID 写含奇偶校验开销,关注 CPU 是否瓶颈)")
 
 
 @_impl("s3_rand_read")
 def s3_rand_read(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "rand_read")
-    return (f"[{lvl}] 4K 随机读 QD32×4: {m.get('r_iops')} IOPS,平均延迟 {m.get('r_lat_us')}μs,"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "rand_read")
+    return (f"4K 随机读 QD32×4: {m.get('r_iops')} IOPS,平均延迟 {m.get('r_lat_us')}μs,"
             f"P99 {m.get('r_p99_us')}μs")
 
 
 @_impl("s3_rand_write")
 def s3_rand_write(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "rand_write")
-    return (f"[{lvl}] 4K 随机写 QD32×4: {m.get('w_iops')} IOPS,平均延迟 {m.get('w_lat_us')}μs,"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "rand_write")
+    return (f"4K 随机写 QD32×4: {m.get('w_iops')} IOPS,平均延迟 {m.get('w_lat_us')}μs,"
             f"P99 {m.get('w_p99_us')}μs")
 
 
 @_impl("s3_randrw")
 def s3_randrw(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "randrw")
-    return (f"[{lvl}] 4K 混合读写 70/30 QD64×4: 混合 {m.get('mixed_iops')} IOPS"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "randrw")
+    return (f"4K 混合读写 70/30 QD64×4: 混合 {m.get('mixed_iops')} IOPS"
             f"(读 {m.get('r_iops')} / 写 {m.get('w_iops')});"
             f"读 P50/P90/P99/P99.9 = {m.get('r_p50_us')}/{m.get('r_p90_us')}/"
             f"{m.get('r_p99_us')}/{m.get('r_p999_us')}μs")
@@ -113,20 +96,22 @@ def s3_randrw(ctx: Ctx) -> str:
 
 @_impl("s3_qd1_lat")
 def s3_qd1_lat(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "qd1_lat")
-    return f"[{lvl}] 4K 随机读 QD1: 平均延迟 {m.get('r_lat_us')}μs,P99 {m.get('r_p99_us')}μs(单路径极限)"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "qd1_lat")
+    return f"4K 随机读 QD1: 平均延迟 {m.get('r_lat_us')}μs,P99 {m.get('r_p99_us')}μs(单路径极限)"
 
 
 @_impl("s3_fsync_lat")
 def s3_fsync_lat(ctx: Ctx) -> str:
-    m, lvl = _fio_raid_case(ctx, "fsync_lat")
-    return (f"[{lvl}] 4K 写+fsync=1: fsync 延迟 {m.get('fsync_lat_us')}μs,"
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "fsync_lat")
+    return (f"4K 写+fsync=1: fsync 延迟 {m.get('fsync_lat_us')}μs,"
             f"写 IOPS {m.get('w_iops')}(数据库类负载关键指标)")
 
 
 @_impl("s3_metadata")
 def s3_metadata(ctx: Ctx) -> str:
-    raid_carry(ctx)
+    _verify_raid_group(ctx)
     if not ctx.sh("command -v python3 || true").out.strip():
         ctx.abort("blocked", "设备无 python3,无法运行元数据脚本")
     tdir = ctx.cfg.get("device_test_dir", "/vol2/.nastest_perf")
@@ -167,16 +152,14 @@ def s3_metadata(ctx: Ctx) -> str:
         ctx.abort("fail", "元数据脚本输出不完整(见日志)")
     for k, v in vals.items():
         ctx.metric(f"files_s_{k.lower()}", v)
-    lvl = raid_record(ctx, {f"files_s_{k.lower()}": v for k, v in vals.items()})
     ctx.sh("rm -f /tmp/nastest_md.py")
-    return (f"[{lvl}] 元数据 1 万文件: " +
+    return ("元数据 1 万文件: " +
             ", ".join(f"{k} {v:.0f} files/s" for k, v in vals.items()) +
             "(小文件 IOPS 远低于裸盘 → FS/RAID 元数据开销,§8 红旗判定依据)")
 
 
 @_impl("s3_raw_read")
 def s3_raw_read(ctx: Ctx) -> str:
-    raid_carry(ctx)
     require_device_tool(ctx, "fio")
     md = ctx.sh("cat /proc/mdstat").out
     m = re.search(r"(sd[a-z]+)\d?\[\d+\]", md)
@@ -197,16 +180,13 @@ def s3_raw_read(ctx: Ctx) -> str:
         except (ValueError, KeyError):
             ctx.abort("fail", "裸盘 fio 解析失败")
     med = record_rounds(ctx, "raw_read_mb_s", per)
-    lvl = raid_record(ctx, {"raw_read_mb_s": med})
-    return (f"[{lvl}] 单裸盘 {dev} 顺序读: {med}MB/s"
+    return (f"单裸盘 {dev} 顺序读: {med}MB/s"
             f"(用于计算 FS 层损耗与 RAID 效率,§5.3)")
 
 
 @_impl("s3_rebuild_monitor")
 def s3_rebuild_monitor(ctx: Ctx) -> str:
     """人工拔盘后点击运行:确认降级 → 监控重建速度曲线 → 叠加 fio 测 IO 衰减。"""
-    from . import db
-
     def mdstat():
         return ctx.sh("cat /proc/mdstat").out
 
@@ -253,13 +233,27 @@ def s3_rebuild_monitor(ctx: Ctx) -> str:
     ctx.metric("rebuild_minutes", dur)
     ctx.metric("rebuild_avg_speed_mb_s", avg_speed)
     ctx.metric("rebuild_curve", curve[::4])
-    base_iops = None
-    ref = db.get_result(ctx.run_id, "S3-03")
-    if ref and ref["status"] == "pass":
-        base_iops = ref["metrics"].get("rand_read_r_iops")
+    det = detect_md_raid(ctx)
+    if det:
+        ctx.metric("rebuild_raid_level", det)
+    base_iops, ref_id = None, None
+    if det:  # 优先取当前阵列级别对应组的随读基线
+        ref = db.get_result(ctx.run_id, f"S3-{det}-03")
+        if ref and ref["status"] == "pass":
+            base_iops = ref["metrics"].get("rand_read_r_iops")
+            ref_id = f"S3-{det}-03"
+    if base_iops is None:  # 回退:任一组已测的随读 IOPS
+        from .raid import RAID_SUBS
+        for lv in RAID_SUBS:
+            ref = db.get_result(ctx.run_id, f"S3-{lv}-03")
+            if ref and ref["status"] == "pass" and ref["metrics"].get("rand_read_r_iops"):
+                base_iops = ref["metrics"]["rand_read_r_iops"]
+                ref_id = f"S3-{lv}-03"
+                break
     if base_iops:
         ctx.metric("baseline_randread_iops", base_iops)
-        ctx.log(f"重建前基线(S3-03) 随机读 {base_iops} IOPS,请对照重建期间业务 IO 表现评估衰减")
+        ctx.log(f"重建前基线({ref_id}) 随机读 {base_iops} IOPS,"
+                f"请对照重建期间业务 IO 表现评估衰减")
     return (f"重建监控 {dur} 分钟,平均速度 {avg_speed}MB/s,曲线见 metrics.rebuild_curve;"
             f"请人工确认重建期间业务 IO 衰减程度(§8:<30% 优)并在备注记录")
 

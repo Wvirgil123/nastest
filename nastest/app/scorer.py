@@ -3,7 +3,7 @@
 不做加权评分与一票否决;对每个可量化维度给出 优/良/及格/差 评级,
 回答方案 §1 的四个核心问题,并自动检测 ARM 红旗信号。指标缺失 → "—"。
 """
-from . import db
+from . import db, raid
 from .registry import CASES
 
 
@@ -13,6 +13,13 @@ def _m(results: dict, case_id: str, key: str):
         return None
     v = (r.get("metrics") or {}).get(key)
     return v if isinstance(v, (int, float)) else None
+
+
+def _s3(results: dict, lv: str | None, n: str, key: str):
+    """S3 RAID 组指标查找;无已测级别时返回 None。"""
+    if not lv:
+        return None
+    return _m(results, raid.level_case(lv, n), key)
 
 
 def _grade(v, t_ex, t_good, t_pass, lower_better=False):
@@ -36,9 +43,9 @@ def _grade(v, t_ex, t_good, t_pass, lower_better=False):
     return "差"
 
 
-def _data_disks(cfg: dict) -> int:
+def _data_disks(cfg: dict, lv: str | None) -> int:
     n = int(cfg.get("disk_count", 4) or 4)
-    lvl = str(cfg.get("raid_level", "")).upper()
+    lvl = (lv or str(cfg.get("raid_level", ""))).upper()
     if "RAID6" in lvl:
         return max(n - 2, 1)
     if "RAID5" in lvl:
@@ -54,6 +61,7 @@ def score_run(run_id: int) -> dict:
     run = db.get_run(run_id)
     cfg = run["config"]
     results = {r["case_id"]: r for r in db.list_results(run_id)}
+    lv = raid.pick_level(results, cfg)   # §8 评级采用的 RAID 组(有数据的组)
     link_mb_s = int(cfg.get("nic_link_mbps", 1000)) / 8
 
     grades: list[dict] = []
@@ -83,18 +91,18 @@ def score_run(run_id: int) -> dict:
         "写/读损失均值(§8:<20% 优;腰斩以上=AES 硬件指令未启用)")
 
     # 3) RAID 顺序写效率(÷数据盘数,以裸盘读为近似参照)
-    seq_w = _m(results, "S3-02", "seq_write_w_mbps")
-    raw = _m(results, "S3-09", "raw_read_mb_s")
-    dd = _data_disks(cfg)
+    seq_w = _s3(results, lv, "02", "seq_write_w_mbps")
+    raw = _m(results, "S3-BASE-01", "raw_read_mb_s")
+    dd = _data_disks(cfg, lv)
     raid_eff = round(seq_w / (raw * dd) * 100, 1) if seq_w and raw else None
-    add("raid_eff", "RAID 顺序写效率",
+    add("raid_eff", f"RAID 顺序写效率{f'({lv})' if lv else ''}",
         f"{raid_eff}%" if raid_eff is not None else "—",
         _grade(raid_eff, 90, 75, 60),
         f"顺序写 {seq_w or '—'}MB/s ÷ (裸盘 {raw or '—'}MB/s × {dd} 数据盘;"
-        f"{cfg.get('raid_level')}),写参照读为近似(§8:≥90% 优)")
+        f"{lv or cfg.get('raid_level')}),写参照读为近似(§8:≥90% 优)")
 
     # 4) FS 层损耗(vs 裸盘聚合读)
-    seq_r = _m(results, "S3-01", "seq_read_r_mbps")
+    seq_r = _s3(results, lv, "01", "seq_read_r_mbps")
     fs_loss = round((1 - seq_r / (raw * dd)) * 100, 1) if seq_r and raw else None
     add("fs_loss", "文件系统层损耗(vs 裸盘)",
         f"{fs_loss}%" if fs_loss is not None else "—",
@@ -120,7 +128,7 @@ def score_run(run_id: int) -> dict:
     add("throttle", "热降频", tval, tgrade, "温度-频率-吞吐相关性分析(§8:无降频 优)")
 
     # 7) 重建期间业务 IO 衰减(人工录入)
-    rebuild = _m(results, "S3-10", "rebuild_io_degrade_pct")
+    rebuild = _m(results, "S3-BASE-02", "rebuild_io_degrade_pct")
     add("rebuild_loss", "重建期间业务 IO 衰减",
         f"{rebuild}%" if rebuild is not None else "—",
         _grade(rebuild, 30, 50, 70, lower_better=True),
@@ -156,7 +164,7 @@ def score_run(run_id: int) -> dict:
                      f"{round(smb_w / (iperf_tx or link_mb_s) * 100) if iperf_tx else '—'}%)")
     if seq_w:
         parts.append(f"本地顺序写 {seq_w}MB/s")
-    fio_cpu = _m(results, "S3-02", "seq_write_fio_cpu_pct")
+    fio_cpu = _s3(results, lv, "02", "seq_write_fio_cpu_pct")
     if fio_cpu is not None:
         parts.append(f"写入时 fio CPU {fio_cpu}%")
     four.append({"q": "瓶颈在哪一层?",
@@ -209,8 +217,8 @@ def score_run(run_id: int) -> dict:
     flag("长跑后性能阶梯式下降(热降频/GC)",
          (var is not None and var > 20) or bool(throttled),
          f"波动 {var if var is not None else '—'}%;对照 soak.csv 温度-频率-吞吐三联曲线")
-    md_create = _m(results, "S3-08", "files_s_create")
-    rand_w = _m(results, "S3-04", "rand_write_w_iops")
+    md_create = _s3(results, lv, "08", "files_s_create")
+    rand_w = _s3(results, lv, "04", "rand_write_w_iops")
     small_flag = None
     if md_create is not None and rand_w:
         small_flag = md_create < rand_w * 0.1

@@ -4,7 +4,7 @@ import re
 import subprocess
 import time
 
-from . import db, evidence, sampler
+from . import db, evidence, raid, sampler
 from .ctx import (Ctx, device_nic, device_snapshot, device_delta, fio_cmd,
                   iperf_cleanup, iperf_servers, make_soak_sample_fn,
                   record_rounds, require_device_tool)
@@ -267,10 +267,11 @@ def s8_full_capacity(ctx: Ctx) -> str:
             res[key] = p.get(want)
             ctx.metric(f"full_{key}_{want}", p.get(want))
             ctx.sh(f"rm -f {tdir}/{key}.*")
-        # 对比空卷基线
+        # 对比空卷基线(取有数据的 RAID 组:优先运行配置级别)
         base = {}
-        ref2 = db.get_result(ctx.run_id, "S3-02")
-        ref4 = db.get_result(ctx.run_id, "S3-04")
+        lv = raid.pick_level(raid.results_by_id(ctx.run_id), ctx.cfg)
+        ref2 = db.get_result(ctx.run_id, raid.level_case(lv, "02")) if lv else None
+        ref4 = db.get_result(ctx.run_id, raid.level_case(lv, "04")) if lv else None
         if ref2 and ref2["status"] == "pass":
             base["seq_w"] = ref2["metrics"].get("seq_write_w_mbps")
         if ref4 and ref4["status"] == "pass":
@@ -283,7 +284,7 @@ def s8_full_capacity(ctx: Ctx) -> str:
             ctx.metric("rand_write_degrade_pct", deg)
         return (f"满容量({full_pct}%)复测: 顺序写 {res['seq_write']}MB/s"
                 + (f"(空卷 {base['seq_w']},衰减 {ctx.metrics.get('seq_write_degrade_pct')}%)"
-                   if base.get("seq_w") else "(无空卷基线,请先跑 S3-02)")
+                   if base.get("seq_w") else "(无空卷基线,请先运行对应 RAID 组的顺序写用例)")
                 + f";4K 随机写 {res['rand_write']}IOPS"
                 + (f"(空卷 {base['rand_w']},衰减 {ctx.metrics.get('rand_write_degrade_pct')}%)"
                    if base.get("rand_w") else "") + "。§8:衰减<10% 优")
@@ -312,7 +313,10 @@ def s9_power(ctx: Ctx) -> str:
     r51 = db.get_result(ctx.run_id, "S5-01")
     if r51 and r51["status"] == "pass" and r51["metrics"].get("write_mbps"):
         refs["SMB 写"] = r51["metrics"]["write_mbps"]
-    r32 = db.get_result(ctx.run_id, "S3-02")
+    r32 = None
+    lv = raid.pick_level(raid.results_by_id(ctx.run_id), ctx.cfg)
+    if lv:
+        r32 = db.get_result(ctx.run_id, raid.level_case(lv, "02"))
     if r32 and r32["status"] == "pass" and r32["metrics"].get("seq_write_w_mbps"):
         refs["本地顺序写"] = r32["metrics"]["seq_write_w_mbps"]
     eff = {}

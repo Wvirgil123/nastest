@@ -10,12 +10,14 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from . import config, db, evidence, preflight, reporter, sampler
+from . import config, db, evidence, migrate, preflight, reporter, sampler
 from .executor import drop_executor, get_executor, has_active_threads, manual_ids
+from .raid import S3_SUBS
 from .registry import BY_ID, CASES
 from .scorer import score_run
 
 db.init_db()
+migrate.s3_groups()   # 旧版 S3-01..10 → 子组编号(幂等,无旧数据时直接跳过)
 
 app = FastAPI(title="ARM-NAS 极限性能测试后台")
 app.mount("/static", StaticFiles(directory=config.BASE_DIR / "static"), name="static")
@@ -39,7 +41,7 @@ def _case_meta() -> list[dict]:
         "id": c.id, "domain": c.domain, "title": c.title, "mode": c.mode,
         "tier": c.tier, "steps": c.steps, "expected": c.expected,
         "guide": c.guide, "hazard": c.hazard, "deps": c.deps,
-        "has_impl": c.impl is not None,
+        "has_impl": c.impl is not None, "sub": c.sub,
     } for c in CASES]
 
 
@@ -265,19 +267,34 @@ async def api_run_case(run_id: int, case_id: str, request: Request):
 
 
 @app.post("/api/runs/{run_id}/domains/{domain}/run")
-def api_run_domain(run_id: int, domain: str):
-    """域顺序运行:依次执行该域所有可执行子测试(跳过运行中/高危/纯人工项)。"""
+async def api_run_domain(run_id: int, domain: str, request: Request):
+    """域顺序运行:依次执行该域所有可执行子测试(跳过运行中/高危/纯人工项)。
+
+    S3 域按子组运行:body 传 {"sub": "basic"|"RAID0"|"RAID1"|"RAID5"|"RAID6"|"RAID10"},
+    与人工切换后的阵列级别对应;执行前各用例自动校验阵列级别。
+    """
     if domain not in config.DOMAIN_ORDER:
         raise HTTPException(404, "域不存在")
     run = db.get_run(run_id)
     if run is None:
         raise HTTPException(404, "任务不存在")
+    sub = None
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if body.get("sub"):
+        if domain != "S3":
+            raise HTTPException(400, "仅 S3 域支持子组运行")
+        if body["sub"] not in S3_SUBS:
+            raise HTTPException(400, f"未知子组: {body['sub']}")
+        sub = body["sub"]
     ex = get_executor(run_id)
     if run["status"] == "paused":
         if ex.thread and ex.thread.is_alive():
             raise HTTPException(409, "任务处于暂停状态,请先恢复后再运行")
         ex._pause.clear()   # 仅有暂停标记、无运行中的自动阶段 → 直接继续
-    queued, skipped = ex.run_domain(domain)
+    queued, skipped = ex.run_domain(domain, sub)
     return {"ok": True, "queued": queued, "skipped": skipped}
 
 
