@@ -518,6 +518,58 @@ def _render_storage_md(A, st: dict) -> None:
 
 
 # ---------------- 上下文与 Markdown ----------------
+# 2.3 各指标含义 —— MD 报告与 HTML 模板共用
+GLOSSARY = [
+    {"name": "吞吐(MB/s)",
+     "meaning": "单位时间传输的数据量,即带宽;bs=1M 顺序读写测的就是它",
+     "judge": "大文件拷贝/备份场景首要指标;对照硬件上限(网卡线速、PCIe 通道、盘介质)判断是否跑满"},
+    {"name": "IOPS",
+     "meaning": "每秒完成的 I/O 操作数;4K 高队列深度随机读写测峰值能力",
+     "judge": "小文件/数据库类随机访问场景首要指标;机械盘受磁头寻道限制,随机 IOPS 通常在几百量级"},
+    {"name": "块大小 bs",
+     "meaning": "单次 I/O 的数据量。4K 是文件系统/页缓存原子单位,IOPS 最坏情形;1M 为大块顺序,测带宽",
+     "judge": "同一负载下 吞吐 ≈ IOPS × bs,可交叉验证数据一致性"},
+    {"name": "队列深度 QD(iodepth)",
+     "meaning": "每个 job 同时下发、尚未完成的 I/O 个数;QD1 测单次延迟,QD32/64 测压满峰值",
+     "judge": "吞吐 ≈ 并发 ÷ 延迟(Little's Law);QD 升高吞吐不再涨即设备已饱和"},
+    {"name": "jobs(numjobs)",
+     "meaning": "fio 并行线程数,模拟多流并发访问",
+     "judge": "机械盘多 job 顺序读会因磁头在多路文件间交插寻道而吞吐腰斩,故矩阵含 numjobs=1 单流用例测真实带宽上限"},
+    {"name": "延迟 P50/P99(μs)",
+     "meaning": "百分位延迟:P50=中位数代表典型体验,P99=最慢 1% 请求的尾部延迟",
+     "judge": "P99 相对 P50 的倍数反映稳定性;尾部尖刺常对应磁头寻道、缓存失效或 RAID 校验计算"},
+    {"name": "CPU%(整机)",
+     "meaning": "测试期间全部 CPU 核的非空闲时间占比,按 /proc/stat 前后差值计算(iowait 计为忙)",
+     "judge": "CPU 低而吞吐低→瓶颈在盘/网络;CPU 接近打满→算力或协议栈瓶颈"},
+    {"name": "逐核 CPU%(c0..cN-1)",
+     "meaning": "各核使用率,按 c0..cN-1 顺序列出",
+     "judge": "RK3576 为大小核(4×A72+4×A53)架构,整机均值会掩盖单核饱和;某核 100% 其余空闲=单线程瓶颈(如单线程协议进程落在小核)"},
+    {"name": "fsync 延迟",
+     "meaning": "从发出 fsync 到数据真正落盘的耗时,测“写入已可靠持久化”的真实延迟",
+     "judge": "直接影响数据库、虚拟机磁盘等要求强持久化场景的响应速度"},
+    {"name": "files/s(元数据)",
+     "meaning": "每秒创建/删除/改名等元数据操作数(S3-08、S7 元数据用例)",
+     "judge": "考验文件系统元数据路径,ARM 平台常呈单核瓶颈,数值远低于裸盘 IOPS 属预期,过低则排查 FS/RAID 开销"},
+    {"name": "PPS / 丢包率 / jitter",
+     "meaning": "每秒收发包数 / 丢失比例 / 延迟抖动(S4-04 UDP 小包)",
+     "judge": "小包转发考验 CPU 中断与网络栈效率;jitter 大说明系统调度不稳定"},
+    {"name": "波动% / 温度 / 频率(浸泡)",
+     "meaning": "长时间满载下吞吐的波动幅度、CPU 温度与运行频率(S8 浸泡)",
+     "judge": "波动 <10% 且无持续降频为达标;吞吐骤降伴随频率下跌即热降频"},
+    {"name": "中位数(多轮)",
+     "meaning": "每个用例多轮测试取中位数而非平均值",
+     "judge": "中位数抗离群值,比均值更能代表典型水平;各轮原始值保留在 metrics 的 *_rounds 键"},
+]
+
+
+def _render_glossary_md(A) -> None:
+    A("| 指标 | 含义 | 判读要点 |")
+    A("|---|---|---|")
+    for g in GLOSSARY:
+        A(f"| **{g['name']}** | {g['meaning']} | {g['judge']} |")
+    A("")
+
+
 def report_context(run_id: int, regen_charts: bool = False) -> dict:
     run = db.get_run(run_id)
     results = {r["case_id"]: r for r in db.list_results(run_id)}
@@ -541,6 +593,7 @@ def report_context(run_id: int, regen_charts: bool = False) -> dict:
             "soak": soak_hours(run_id),
         },
         "method": methodology(run["config"]),
+        "glossary": GLOSSARY,
         "manual_rows": manual_guidance(results),
         "charts": charts.generate_charts(run_id, results, run["config"],
                                          force=regen_charts),
@@ -596,8 +649,12 @@ def generate_markdown(run_id: int) -> Path:
         A("- (未执行 S0-01 基线采集)")
     A("")
 
-    # ---- 四问答 ----
-    A("## 二、四个核心问题(§1)")
+    # ---- 综合分析 ----
+    A("## 二、综合分析")
+    A("")
+    A("### 2.1 综合分析(§1 四个核心问题)")
+    A("")
+    A("*以下四个核心问题为基于实测数据的自动结论;人工综合分析待补充。*")
     A("")
     for fq in score["four_questions"]:
         A(f"**{fq['q']}**")
@@ -605,12 +662,26 @@ def generate_markdown(run_id: int) -> Path:
         A(f"- 判读:{fq['detail']}")
         A("")
 
+    A("### 2.2 图表分析")
+    A("")
+    _embed("raid_seq", "各 RAID 级别顺序吞吐对比")
+    _embed("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")
+    _embed("protocols", "文件协议读写吞吐横向对比")
+    _embed("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")
+    _embed("scale", "并发扩展曲线")
+    _embed("crypto", "加密算法性能对比(openssl speed)")
+    if not C:
+        A("(暂无图表:相关用例完成后重新生成报告即出图)")
+        A("")
+
+    A("### 2.3 各指标含义")
+    A("")
+    _render_glossary_md(A)
+
     # ---- 存储表(按 RAID 细分) ----
     A("## 三、存储子系统(§5.3,中位数)")
     A("")
     _render_storage_md(A, T["storage"])
-    _embed("raid_seq", "各 RAID 级别顺序吞吐对比")
-    _embed("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")
     _render_method_md(A, ctx["method"].get("storage"))
 
     # ---- 协议表 ----
@@ -623,8 +694,6 @@ def generate_markdown(run_id: int) -> Path:
           f"{_fmt(r.get('p99'))} | {_fmt(r.get('cpu'))} | {r.get('cpu_cores') or '—'} | "
           f"{r.get('enc') or '—'} | {r.get('note') or ''} |")
     A("")
-    _embed("protocols", "文件协议读写吞吐横向对比")
-    _embed("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")
     _render_method_md(A, ctx["method"].get("protocol"))
 
     # ---- 并发表 ----
@@ -642,7 +711,6 @@ def generate_markdown(run_id: int) -> Path:
     else:
         A("(未执行 S6-01/S6-02)")
     A("")
-    _embed("scale", "并发扩展曲线")
     _render_method_md(A, ctx["method"].get("scale"))
 
     # ---- 浸泡小时表 ----
@@ -681,7 +749,6 @@ def generate_markdown(run_id: int) -> Path:
         A(f"- **{mark}** — {f['desc']}")
         A(f"  - {f['detail']}")
     A("")
-    _embed("crypto", "加密算法性能对比(openssl speed)")
 
     # ---- 人工项 ----
     if ctx["manual_rows"]:

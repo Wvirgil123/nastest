@@ -43,9 +43,12 @@
   {% endif %}
 </section>
 
-<!-- 四问答 -->
+<!-- 综合分析 -->
 <section class="card">
-  <h3>二、四个核心问题(§1)</h3>
+  <h3>二、综合分析</h3>
+
+  <h4 style="margin:18px 0 8px">2.1 综合分析(§1 四个核心问题)</h4>
+  <div class="small muted" style="margin-bottom:8px">以下四个核心问题为基于实测数据的自动结论;人工综合分析待补充。</div>
   {% for fq in score.four_questions %}
   <div class="qa">
     <b>{{ fq.q }}</b>
@@ -53,6 +56,28 @@
     <div class="detail">{{ fq.detail }}</div>
   </div>
   {% endfor %}
+
+  <h4 style="margin:18px 0 8px">2.2 图表分析</h4>
+  {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
+                      ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比"),
+                      ("protocols", "文件协议读写吞吐横向对比"),
+                      ("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽"),
+                      ("scale", "并发扩展曲线"),
+                      ("crypto", "加密算法性能对比(openssl speed)")] %}
+  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
+  {% endfor %}
+
+  <h4 style="margin:18px 0 8px">2.3 各指标含义</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th style="width:180px">指标</th><th>含义</th><th>判读要点</th></tr></thead>
+    <tbody>
+    {% for g in glossary %}
+    <tr><td><b>{{ g.name }}</b></td><td class="small">{{ g.meaning }}</td><td class="small">{{ g.judge }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
 </section>
 
 <!-- 存储表(按 RAID 细分) -->
@@ -95,10 +120,6 @@
   </table>
   </div>
   {% endif %}
-  {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
-                      ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")] %}
-  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
-  {% endfor %}
   {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
 </section>
 
@@ -117,10 +138,6 @@
     </tbody>
   </table>
   </div>
-  {% for key, alt in [("protocols", "文件协议读写吞吐横向对比"),
-                      ("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")] %}
-  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
-  {% endfor %}
   {% with entry = method.protocol %}{% include "_method_block.html" %}{% endwith %}
 </section>
 
@@ -140,7 +157,6 @@
   </table>
   </div>
   {% if tables.scale_note %}<div class="small" style="margin-top:6px">{{ tables.scale_note }}</div>{% endif %}
-  {% if charts.get("scale") %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts['scale'] }}" alt="并发扩展曲线">{% endif %}
   {% else %}<div class="muted">未执行 S6-01/S6-02。</div>{% endif %}
   {% with entry = method.scale %}{% include "_method_block.html" %}{% endwith %}
 </section>
@@ -196,7 +212,6 @@
     <div class="small muted" style="margin-left:22px">{{ f.detail }}</div>
   </div>
   {% endfor %}
-  {% if charts.get("crypto") %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts['crypto'] }}" alt="加密算法性能对比(openssl speed)">{% endif %}
 </section>
 
 <!-- 人工项 -->
