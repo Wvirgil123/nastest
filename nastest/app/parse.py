@@ -62,6 +62,29 @@ def parse_fio_json(text: str) -> dict:
     return out
 
 
+def parse_fio_json_multi(text: str) -> dict:
+    """多 job fio(每盘一个 job 的裸盘并发测试):汇总全部 job 的带宽/IOPS。
+
+    parse_fio_json 只取 jobs[0],适用于单 job/group_reporting 合并的场景;
+    裸盘并发用例 N 个 --name/--filename 各自独立报告,需求和。
+    """
+    data = _extract_json(text)
+    jobs = data.get("jobs") or []
+    if not jobs:
+        raise ValueError("fio JSON 无 jobs")
+    out: dict = {}
+    for side in ("read", "write"):
+        bw = sum((j.get(side) or {}).get("bw") or 0 for j in jobs)
+        iops = sum((j.get(side) or {}).get("iops") or 0 for j in jobs)
+        if bw > 0:
+            key = side[:1]
+            out[f"{key}_mbps"] = round(bw / 1024.0, 2)
+            out[f"{key}_iops"] = round(iops, 1)
+    if not out:
+        raise ValueError("fio JSON 各 job 均无读/写带宽")
+    return out
+
+
 def parse_fio_fsync(text: str) -> dict:
     """fsync=1 用例:取 fsync 延迟分布。"""
     data = _extract_json(text)

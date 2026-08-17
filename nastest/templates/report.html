@@ -120,6 +120,23 @@
   </table>
   </div>
   {% endif %}
+  {% if tables.raw %}
+  <h4 style="margin:14px 0 6px">裸盘基线(S3-BASE-03/04,绕过文件系统直读/写裸设备)</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>项目</th><th>参数</th><th>吞吐(MB/s)</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th></tr></thead>
+    <tbody>
+    {% for r in tables.raw %}
+    <tr><td>{{ r.case }}</td><td class="small">{{ r.spec }}</td>
+      <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td>
+      <td>{{ r.cpu if r.cpu is not none else '—' }}</td>
+      <td class="small">{{ r.cpu_cores or '—' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="small muted">逐盘差距 &gt;15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;裸盘写(S3-BASE-04)为破坏性用例,仅盘不在阵列中时可运行。</div>
+  {% endif %}
   {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
 </section>
 

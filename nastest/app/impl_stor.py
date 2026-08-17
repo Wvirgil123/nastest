@@ -1,13 +1,15 @@
 """S3 存储子系统 / S4 网络层 用例实现。"""
 import re
+import statistics
 import time
 
 from . import db
-from .ctx import (Ctx, _pick_fio_engine, device_delta, device_snapshot,
-                  fio_cmd, fio_profile, iperf_cleanup, iperf_local,
-                  iperf_multi_local, iperf_servers, record_rounds,
+from .ctx import (Ctx, _pick_fio_engine, device_delta, device_nic,
+                  device_snapshot, fio_cmd, fio_profile, iperf_cleanup,
+                  iperf_local, iperf_multi_local, iperf_servers, record_rounds,
                   require_device_tool, require_local_sudo, require_local_tool,
                   rounds)
+from .parse import parse_fio_json, parse_fio_json_multi
 
 IMPL: dict[str, callable] = {}
 
@@ -204,6 +206,162 @@ def s3_raw_read(ctx: Ctx) -> str:
     med = record_rounds(ctx, "raw_read_mb_s", per)
     return (f"单裸盘 {dev} 顺序读: {med}MB/s"
             f"(用于计算 FS 层损耗与 RAID 效率,§5.3)")
+
+
+# ---- 裸盘逐盘 + 全盘并发读写(S3-BASE-03/04) ----
+# 参数对齐常用手工基准:单盘 bs=1M QD8 size=2G,并发每盘一个 job QD4 size=1G;
+# 裸盘顺序吞吐非常稳定,单轮 30s + rounds 轮中位数足够,避免占用整盘过久。
+_RAW_RUNTIME = 30
+_RAW_SIZE_ONE = "2G"    # 单盘测试工作区(direct=1 直通,不经缓存)
+_RAW_SIZE_ALL = "1G"    # 并发时每盘工作区
+
+
+def _detect_raw_disks(ctx: Ctx) -> list[str]:
+    """枚举数据裸盘(/dev/sd*):整盘、机械旋转(ROTA=1)、SATA/SAS 接口。
+
+    排除分区、NVMe/eMMC/SD(ROTA=0)与 USB 外接盘,防止误测系统盘/外接盘。
+    """
+    r = ctx.sh("lsblk -dnpo NAME,TYPE,ROTA,TRAN",
+               note="枚举裸盘(整盘/机械/SATA)")
+    if r.rc != 0:   # 老版本 lsblk 无 TRAN 列
+        r = ctx.sh("lsblk -dnpo NAME,TYPE,ROTA")
+    disks = []
+    for ln in r.out.splitlines():
+        p = ln.split()
+        if len(p) >= 3 and p[1] == "disk" and p[2] == "1" \
+                and p[0].startswith("/dev/"):
+            if len(p) < 4 or p[3].lower() in ("sata", "sas", "ata"):
+                disks.append(p[0])
+    disks.sort()
+    if not disks:
+        ctx.abort("blocked", "未检测到 SATA 机械裸盘(lsblk ROTA=1);"
+                             "若盘在 USB/NVMe 上或 lsblk 输出异常,请人工核查后手动测试")
+    want = int(ctx.cfg.get("disk_count") or 0)
+    if want and len(disks) != want:
+        ctx.log(f"[!] 检测到 {len(disks)} 块裸盘,配置 disk_count={want},"
+                f"按实际检测的盘执行: {disks}")
+    ctx.log(f"[裸盘] 目标盘: {disks}")
+    return disks
+
+
+def _md_member_devs(ctx: Ctx) -> set[str]:
+    """/proc/mdstat 中活动 md 阵列的成员块设备名(含分区,如 sda1)。"""
+    md = ctx.sh("cat /proc/mdstat").out
+    return {m.group(1) for m in re.finditer(r"\b(sd[a-z]+\d*)\[\d+\]", md)}
+
+
+def _used_parts(ctx: Ctx, dev: str) -> list[str]:
+    """该盘(含分区)上的挂载点/swap;返回 ['sda1:/vol1', …] 形式,空=未占用。"""
+    r = ctx.sh(f"lsblk -nlo NAME,MOUNTPOINT {dev}")
+    used = []
+    for ln in r.out.splitlines():
+        p = ln.split(None, 1)
+        if len(p) == 2 and p[1].strip():
+            used.append(f"{p[0]}:{p[1].strip()}")
+    return used
+
+
+def _raw_disk_test(ctx: Ctx, rw: str) -> str:
+    """rw=read/write:逐盘 fio + 全盘并发 fio,各 rounds 轮取中位数。"""
+    require_device_tool(ctx, "fio")
+    engine = _pick_fio_engine(ctx)
+    disks = _detect_raw_disks(ctx)
+    prefix = "raw_read" if rw == "read" else "raw_write"
+    cn = "读" if rw == "read" else "写"
+    side = rw[0]
+
+    if rw == "write":
+        members = _md_member_devs(ctx)
+        problems = []
+        for d in disks:
+            name = d.rsplit("/", 1)[-1]
+            md_hit = sorted(x for x in members if x == name or x.startswith(name))
+            used = _used_parts(ctx, d)
+            if md_hit:
+                problems.append(f"{d} 是活动 md 阵列成员({','.join(md_hit)})")
+            if used:
+                problems.append(f"{d} 存在挂载/swap 分区({';'.join(used)})")
+        if problems:
+            ctx.abort("blocked",
+                      "裸盘写为破坏性操作,以下盘仍在使用:\n- " + "\n- ".join(problems) +
+                      "\n请先停止阵列(sudo mdadm --stop /dev/mdX)/卸载后再运行;"
+                      "或改跑只读的 S3-BASE-03")
+        ctx.log(f"[⚠ 破坏性操作] 将向每块裸盘头部区域写入({prefix}),"
+                f"盘上数据将全部失效")
+    ctx.metric(f"{prefix}_disks", [d.rsplit("/", 1)[-1] for d in disks])
+
+    # 逐盘
+    per_disk: dict[str, float] = {}
+    for d in disks:
+        name = d.rsplit("/", 1)[-1]
+        vals = []
+        for i in range(rounds(ctx)):
+            if ctx.stop_requested():
+                ctx.abort("fail", "用户中止")
+            r = ctx.sh(f"fio --name={prefix}_{name} --filename={d} --rw={rw} --bs=1M "
+                       f"--size={_RAW_SIZE_ONE} --ioengine={engine} --iodepth=8 "
+                       f"--direct=1 --time_based --runtime={_RAW_RUNTIME} "
+                       f"--output-format=json", timeout=_RAW_RUNTIME + 300,
+                       sudo=True, note=f"裸盘{cn} {name} 第 {i + 1} 轮")
+            if r.rc != 0:
+                ctx.abort("fail", f"{d} 裸盘 fio 失败 rc={r.rc}(详见 stdout.log)")
+            try:
+                vals.append(parse_fio_json(r.out)[f"{side}_mbps"])
+            except (ValueError, KeyError):
+                ctx.abort("fail", f"{d} 裸盘 fio 解析失败(输出见 stdout.log)")
+        per_disk[name] = record_rounds(ctx, f"{prefix}_{name}_mb_s", vals)
+
+    # 全盘并发(每盘一个 job)
+    nic = device_nic(ctx)
+    jobs = " ".join(f"--name=d{i + 1} --filename={d}" for i, d in enumerate(disks))
+    cmd = (f"fio --rw={rw} --bs=1M --size={_RAW_SIZE_ALL} --ioengine={engine} "
+           f"--iodepth=4 --direct=1 --time_based --runtime={_RAW_RUNTIME} "
+           f"--group_reporting --output-format=json {jobs}")
+    totals, cpus, core_rounds = [], [], []
+    for i in range(rounds(ctx)):
+        if ctx.stop_requested():
+            ctx.abort("fail", "用户中止")
+        pre = device_snapshot(ctx, nic)
+        r = ctx.sh(cmd, timeout=_RAW_RUNTIME + 300, sudo=True,
+                   note=f"全盘并发{cn}({len(disks)} job)第 {i + 1} 轮")
+        delta = device_delta(pre, device_snapshot(ctx, nic))
+        if delta.get("cpu_pct") is not None:
+            cpus.append(delta["cpu_pct"])
+        if delta.get("cpu_per_core"):
+            core_rounds.append(delta["cpu_per_core"])
+        if r.rc != 0:
+            ctx.abort("fail", f"全盘并发 fio 失败 rc={r.rc}(详见 stdout.log)")
+        try:
+            totals.append(parse_fio_json_multi(r.out)[f"{side}_mbps"])
+        except (ValueError, KeyError):
+            ctx.abort("fail", "全盘并发 fio 解析失败(输出见 stdout.log)")
+    all_med = record_rounds(ctx, f"{prefix}_all_mb_s", totals)
+    if cpus:
+        record_rounds(ctx, f"{prefix}_all_dev_cpu_pct", cpus)
+    if core_rounds:   # 逐核中位数(同 fio_profile 口径)
+        ncore = min(len(c) for c in core_rounds)
+        per_core = []
+        for i in range(ncore):
+            vals = [c[i] for c in core_rounds if c[i] is not None]
+            per_core.append(round(float(statistics.median(vals)), 1) if vals else None)
+        ctx.metric(f"{prefix}_all_dev_cpu_per_core", per_core)
+
+    per_str = ", ".join(f"{name} {v}" for name, v in per_disk.items())
+    slow = (min(per_disk.values()) < 0.85 * max(per_disk.values())
+            if len(per_disk) > 1 else False)
+    warn = ";盘间差距 >15%,疑似慢盘/异常盘,建议复测并关注 SMART" if slow else ""
+    return (f"裸盘{cn}({len(disks)} 盘): {per_str} MB/s;"
+            f"{len(disks)} 盘并发{cn} {all_med}MB/s{warn}")
+
+
+@_impl("s3_raw_read_all")
+def s3_raw_read_all(ctx: Ctx) -> str:
+    return _raw_disk_test(ctx, "read")
+
+
+@_impl("s3_raw_write_all")
+def s3_raw_write_all(ctx: Ctx) -> str:
+    return _raw_disk_test(ctx, "write")
 
 
 @_impl("s3_rebuild_monitor")

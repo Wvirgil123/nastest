@@ -91,6 +91,25 @@ def _s3_cases() -> list[Case]:
                  "2. 点击\"运行\"前从设备拔出一块成员盘(或 sudo mdadm --fail + --remove);\n"
                  "3. 点击\"运行\":框架确认降级后,插回/更换硬盘触发重建并全程监控;\n"
                  "4. 重建期间框架自动叠加 fio 负载测衰减;重建完成后自动结束。"),
+        _c(id="S3-BASE-03", domain="S3", sub="basic",
+           title="裸盘读(逐盘 + 全盘并发)", mode="auto", impl="s3_raw_read_all",
+           hazard="warning", timeout=3600,
+           steps="自动枚举 SATA 机械整盘(lsblk ROTA=1,排除 NVMe/USB/分区);每盘依次 "
+                 "fio read(bs=1M QD8 size=2G runtime=30 direct=1,rounds 轮取中位数),"
+                 "再全盘并发读(每盘一个 job,bs=1M QD4 size=1G);只读不写盘,阵列在役也可运行",
+           expected="记录各盘顺序读 MB/s + 全盘并发读 MB/s、并发时整机/逐核 CPU%;"
+                    "盘间差距大→慢盘/坏盘前兆(§8 红旗);并发合计≈单盘×盘数说明 SATA 控制器无瓶颈"),
+        _c(id="S3-BASE-04", domain="S3", sub="basic",
+           title="裸盘写(逐盘 + 全盘并发)", mode="auto", impl="s3_raw_write_all",
+           hazard="critical", timeout=3600,
+           steps="参数同 BASE-03 但 rw=write;目标盘若是活动 md 阵列成员或存在挂载/swap 分区则拒跑",
+           expected="记录各盘顺序写 MB/s + 全盘并发写 MB/s、并发时整机/逐核 CPU%;"
+                    "与读对比判断盘健康度;写偏低明显→SMR 叠瓦盘或盘异常",
+           guide="⚠️ 本用例会向裸盘扇区直接写入,破坏目标盘上的全部数据"
+                 "(分区表/文件系统/RAID 成员信息)!\n"
+                 "1. 仅适用于盘不在任何阵列中的场景(新盘验收,或数据已备份、准备重建 RAID);\n"
+                 "2. 设备上存在活动 RAID 时请先停止阵列(sudo mdadm --stop /dev/mdX),否则拒跑;\n"
+                 "3. 写入只覆盖每盘前 1~2G 区域,但测试后该盘应视为不再含有效数据。"),
     ]
     for lv in _S3_RAID_LEVELS:
         for n, impl, title, steps, expected in _S3_GROUP_TEMPLATES:
