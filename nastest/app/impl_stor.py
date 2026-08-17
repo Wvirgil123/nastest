@@ -3,10 +3,11 @@ import re
 import time
 
 from . import db
-from .ctx import (Ctx, device_delta, device_snapshot, fio_cmd, fio_profile,
-                  iperf_cleanup, iperf_local, iperf_multi_local, iperf_servers,
-                  record_rounds, require_device_tool, require_local_sudo,
-                  require_local_tool, rounds)
+from .ctx import (Ctx, _pick_fio_engine, device_delta, device_snapshot,
+                  fio_cmd, fio_profile, iperf_cleanup, iperf_local,
+                  iperf_multi_local, iperf_servers, record_rounds,
+                  require_device_tool, require_local_sudo, require_local_tool,
+                  rounds)
 
 IMPL: dict[str, callable] = {}
 
@@ -70,6 +71,22 @@ def s3_seq_write(ctx: Ctx) -> str:
     m = fio_profile(ctx, "seq_write")
     return (f"顺序写 1M QD32×4: {m.get('w_mbps')}MB/s,CPU(整机) {m.get('dev_cpu_pct')}%"
             f"(RAID 写含奇偶校验开销,关注 CPU 是否瓶颈)")
+
+
+@_impl("s3_seq_read_1job")
+def s3_seq_read_1job(ctx: Ctx) -> str:
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "seq_read_1job")
+    return (f"顺序读 1M QD32×1(单流): {m.get('r_mbps')}MB/s,CPU(整机) {m.get('dev_cpu_pct')}%"
+            f"(单流避免多 job 磁头交插,反映 RAID 真实顺序带宽;对比 01 多流)")
+
+
+@_impl("s3_seq_write_1job")
+def s3_seq_write_1job(ctx: Ctx) -> str:
+    _verify_raid_group(ctx)
+    m = fio_profile(ctx, "seq_write_1job")
+    return (f"顺序写 1M QD32×1(单流): {m.get('w_mbps')}MB/s,CPU(整机) {m.get('dev_cpu_pct')}%"
+            f"(单流顺序写真实带宽;对比 02 多流)")
 
 
 @_impl("s3_rand_read")
@@ -175,7 +192,8 @@ def s3_raw_read(ctx: Ctx) -> str:
     per = []
     for i in range(rounds(ctx)):
         r = ctx.sh(f"fio --name=rawread --filename={dev} --rw=read --bs=128k "
-                   f"--iodepth=32 --numjobs=1 --direct=1 --time_based --runtime={runtime} "
+                   f"--ioengine={_pick_fio_engine(ctx)} --iodepth=32 --numjobs=1 "
+                   f"--direct=1 --time_based --runtime={runtime} "
                    f"--output-format=json", timeout=runtime + 300, sudo=True,
                    note=f"裸盘读 第 {i + 1} 轮")
         from .parse import parse_fio_json
@@ -205,7 +223,8 @@ def s3_rebuild_monitor(ctx: Ctx) -> str:
     tdir = ctx.cfg.get("device_test_dir", "/vol2/.nastest_perf")
     ctx.sh(f"mkdir -p {tdir}")
     ctx.sh(f"fio --name=rebuildload --directory={tdir} --size=1G --rw=randread --bs=4k "
-           f"--iodepth=16 --numjobs=2 --direct=1 --time_based --runtime=14400 "
+           f"--ioengine={_pick_fio_engine(ctx)} --iodepth=16 --numjobs=2 --direct=1 "
+           f"--time_based --runtime=14400 "
            f"> /dev/null 2>&1 &", note="叠加业务 IO 负载(后台)")
     curve = []
     t0 = time.time()

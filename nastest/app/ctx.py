@@ -129,6 +129,9 @@ class Ctx:
         self._stop_fn = stop_fn
         self.metrics: dict = {}
         self.started = time.time()
+        # fio 异步引擎探测结果缓存(设备/本机各一份)
+        self._fio_engine = None
+        self._fio_engine_local = None
 
     def log(self, text: str) -> None:
         self._log(text.rstrip("\n") + "\n")
@@ -446,6 +449,10 @@ def iperf_multi_local(ctx: Ctx, ports: list[int], t: int) -> dict:
 FIO_PROFILES = {
     "seq_read":  dict(rw="read", bs="1M", iodepth=32, numjobs=4),
     "seq_write": dict(rw="write", bs="1M", iodepth=32, numjobs=4),
+    # 单流(numjobs=1)顺序读写:多 job 并发顺序读会让机械盘磁头在多路文件间交插寻道,
+    # 吞吐被腰斩(实测 4job≈240MB/s,单流 libaio≈400MB/s)。此 profile 测 RAID 真实顺序带宽。
+    "seq_read_1job":  dict(rw="read", bs="1M", iodepth=32, numjobs=1),
+    "seq_write_1job": dict(rw="write", bs="1M", iodepth=32, numjobs=1),
     "rand_read":  dict(rw="randread", bs="4k", iodepth=32, numjobs=4),
     "rand_write": dict(rw="randwrite", bs="4k", iodepth=32, numjobs=4),
     "randrw":    dict(rw="randrw", bs="4k", iodepth=64, numjobs=4,
@@ -455,12 +462,47 @@ FIO_PROFILES = {
 }
 
 
-def fio_cmd(key: str, target: str, runtime: int, size: str, direct: int = 1,
-            is_dir: bool = True) -> str:
+def _pick_fio_engine(ctx: Ctx, local: bool = False) -> str:
+    """返回 fio 可用的异步引擎(libaio 优先 → io_uring),结果缓存。
+
+    关键:QD 峰值测试必须有异步引擎。fio 默认的 sync 引擎会把 iodepth
+    静默压到 1(日志 warning "queue depth will be capped at 1"),导致
+    测出的是"单路延迟聚合"而非峰值吞吐/IOPS——曾使 S3 全矩阵 QD32/64
+    失效。QD1 用例(qd1_lat/fsync_lat)不需要,仍走同步引擎。
+
+    引擎优先级 libaio > io_uring:实测某些定制内核(如 RK3576 6.18)的
+    io_uring 完成路径有缺陷,顺序读吞吐被压到 libaio 的一半左右,故
+    libaio 可用时绝不使用 io_uring;仅在无 libaio 时回退并显著告警。
+    """
+    attr = "_fio_engine_local" if local else "_fio_engine"
+    eng = getattr(ctx, attr, None)
+    if eng:
+        return eng
+    run = ctx.sh_local if local else ctx.sh
+    who = "本机" if local else "设备"
+    r = run("fio --enghelp 2>/dev/null | awk '{print $1}' | grep -xE 'libaio|io_uring'",
+            timeout=30, note=f"探测 {who} fio 异步引擎(libaio/io_uring)")
+    found = [ln.strip() for ln in (r.out or "").splitlines() if ln.strip()]
+    eng = "libaio" if "libaio" in found else ("io_uring" if "io_uring" in found else "")
+    if not eng:
+        ctx.abort("blocked", f"{who} fio 无异步引擎(libaio/io_uring),无法进行 QD 峰值测试;"
+                             f"请安装 libaio1 后重试。")
+    if eng == "io_uring":
+        ctx.log(f"[!] {who} 无 libaio,回退 io_uring——部分内核 io_uring 会低估吞吐,"
+                f"建议安装 libaio1(apt-get install -y libaio1)后复测")
+    setattr(ctx, attr, eng)
+    ctx.log(f"[fio] 异步引擎: {eng}")
+    return eng
+
+
+def fio_cmd(ctx: Ctx, key: str, target: str, runtime: int, size: str,
+            direct: int = 1, is_dir: bool = True) -> str:
     p = FIO_PROFILES[key]
     loc = f"--directory={target}" if is_dir else f"--filename={target}"
+    # iodepth>1 必须配异步引擎,sync 引擎会把 iodepth 压回 1
+    engine = f"--ioengine={_pick_fio_engine(ctx)} " if p["iodepth"] > 1 else ""
     return (f"fio --name={key} {loc} --size={size} --rw={p['rw']} --bs={p['bs']} "
-            f"--iodepth={p['iodepth']} --numjobs={p['numjobs']} --direct={direct} "
+            f"{engine}--iodepth={p['iodepth']} --numjobs={p['numjobs']} --direct={direct} "
             f"--time_based --runtime={runtime} {p.get('extra', '')} "
             f"--group_reporting --output-format=json")
 
@@ -479,7 +521,7 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
     nic = device_nic(ctx)
     ctx.log(f"profile={key} size={size} runtime={runtime}s warmup={warm}s rounds={n}")
     if warm > 0:
-        r = ctx.sh(fio_cmd(key, tdir, warm, size), timeout=warm + 600,
+        r = ctx.sh(fio_cmd(ctx, key, tdir, warm, size), timeout=warm + 600,
                    note=f"热身 {warm}s")
         if r.rc != 0:
             ctx.abort("fail", f"热身 fio 失败 rc={r.rc}({key}):测试目录 {tdir} 不可用?"
@@ -489,7 +531,7 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
         if ctx.stop_requested():
             ctx.abort("fail", "用户中止")
         pre = device_snapshot(ctx, nic)
-        r = ctx.sh(fio_cmd(key, tdir, runtime, size), timeout=runtime + 600,
+        r = ctx.sh(fio_cmd(ctx, key, tdir, runtime, size), timeout=runtime + 600,
                    note=f"第 {i + 1}/{n} 轮")
         delta = device_delta(pre, device_snapshot(ctx, nic))
         if delta.get("cpu_pct") is not None:
@@ -534,14 +576,14 @@ def fio_local(ctx: Ctx, key: str, directory: str, runtime: int | None = None,
     nic = device_nic(ctx)
     direct = 1
     pre = device_snapshot(ctx, nic)
-    r = ctx.sh_local(fio_cmd(key, directory, runtime, size, direct=direct),
+    r = ctx.sh_local(fio_cmd(ctx, key, directory, runtime, size, direct=direct),
                      timeout=runtime + 600, note=f"本机 fio {key}(挂载点)")
     if r.rc != 0 and "invalid argument" in (r.out + r.err).lower():
         ctx.log("[!] direct=1 在该挂载上不支持,回退 direct=0(含客户端缓存影响,已在报告注明)")
         direct = 0
         ctx.metric("direct_fallback", True)
         pre = device_snapshot(ctx, nic)
-        r = ctx.sh_local(fio_cmd(key, directory, runtime, size, direct=direct),
+        r = ctx.sh_local(fio_cmd(ctx, key, directory, runtime, size, direct=direct),
                          timeout=runtime + 600, note=f"本机 fio {key}(direct=0 重试)")
     # fio 在本机运行,设备端 CPU 用 /proc/stat 快照差值计量(NAS 侧整机占用)
     delta = device_delta(pre, device_snapshot(ctx, nic))

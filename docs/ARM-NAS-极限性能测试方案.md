@@ -63,7 +63,8 @@ ARM NAS 与 x86 NAS 的测试重点不同，以下特性必须在测试设计中
 ```bash
 # 客户端本地盘 fio 自检（应远高于 NAS 预期性能）
 fio --name=local --directory=/data/test --size=8G --rw=randrw --rwmixread=70 \
-    --bs=4k --iodepth=64 --numjobs=4 --direct=1 --runtime=60 --time_based --group_reporting
+    --bs=4k --ioengine=libaio --iodepth=64 --numjobs=4 --direct=1 \
+    --runtime=60 --time_based --group_reporting
 ```
 
 ### 3.2 被测设备基线信息记录（测试前必填）
@@ -191,9 +192,9 @@ lat_mem_rd -P $(nproc) 512 64
 #### 5.3.1 单盘裸性能（绕过文件系统，可选但推荐）
 
 ```bash
-fio --name=disk_seq_w --filename=/dev/sdX --rw=write  --bs=128k --iodepth=32 --direct=1 --size=100%
-fio --name=disk_seq_r --filename=/dev/sdX --rw=read   --bs=128k --iodepth=32 --direct=1 --size=100%
-fio --name=disk_rnd_r --filename=/dev/sdX --rw=randread --bs=4k --iodepth=32 --runtime=120 --time_based --direct=1
+fio --name=disk_seq_w --filename=/dev/sdX --rw=write  --bs=128k --ioengine=libaio --iodepth=32 --direct=1 --size=100%
+fio --name=disk_seq_r --filename=/dev/sdX --rw=read   --bs=128k --ioengine=libaio --iodepth=32 --direct=1 --size=100%
+fio --name=disk_rnd_r --filename=/dev/sdX --rw=randread --bs=4k --ioengine=libaio --iodepth=32 --runtime=120 --time_based --direct=1
 ```
 
 #### 5.3.2 RAID / 卷性能（fio 标准矩阵）
@@ -210,10 +211,12 @@ fio --name=disk_rnd_r --filename=/dev/sdX --rw=randread --bs=4k --iodepth=32 --r
 | 4K 随机读延迟 | randread | 4k | 1 | 1 | 最低延迟（QD1） |
 | 提交延迟 | write + fsync=1 | 4k | 1 | 1 | 数据库类负载 |
 
+> ⚠️ **iodepth > 1 必须配异步引擎**：fio 默认 `sync` 引擎会把 iodepth 静默压回 1，测出的是单路延迟而非峰值。所有 iodepth≥32/64 用例须加 `--ioengine=libaio`（或 io_uring）。QD1 用例无需。
+
 ```bash
 # 示例：混合读写，输出 P50/P99/P99.9 延迟
 fio --name=mix --directory=/volume1/fio --size=16G \
-    --rw=randrw --rwmixread=70 --bs=4k --iodepth=64 --numjobs=4 \
+    --rw=randrw --rwmixread=70 --bs=4k --ioengine=libaio --iodepth=64 --numjobs=4 \
     --direct=1 --runtime=300 --time_based --group_reporting \
     --percentile_list=50:90:99:99.9
 
@@ -407,7 +410,8 @@ run 300
 # NAS 侧组合压力（示例）
 stress-ng --cpu $(nproc) --cpu-method all --timeout 24h &
 fio --name=soak --directory=/volume1/fio --size=64G --rw=randrw --rwmixread=70 \
-    --bs=4k --iodepth=32 --numjobs=4 --direct=1 --runtime=86400 --time_based &
+    --bs=4k --ioengine=libaio --iodepth=32 --numjobs=4 --direct=1 \
+    --runtime=86400 --time_based &
 # 客户端对 NAS 持续打流 24h（iperf3 -t 86400，多实例）
 ```
 
@@ -534,10 +538,10 @@ OMP_NUM_THREADS=$(nproc) ./stream
 
 # ── 存储 ──
 fio --name=seq_w --directory=/volume1/fio --size=16G --rw=write --bs=1M \
-    --iodepth=32 --numjobs=4 --direct=1 --group_reporting
+    --ioengine=libaio --iodepth=32 --numjobs=4 --direct=1 --group_reporting
 fio --name=randmix --directory=/volume1/fio --size=16G --rw=randrw --rwmixread=70 \
-    --bs=4k --iodepth=64 --numjobs=4 --direct=1 --runtime=300 --time_based \
-    --group_reporting --percentile_list=50:90:99:99.9
+    --bs=4k --ioengine=libaio --iodepth=64 --numjobs=4 --direct=1 \
+    --runtime=300 --time_based --group_reporting --percentile_list=50:90:99:99.9
 mdtest -d /volume1/fio -n 10000 -i 3 -F -C -T -r
 
 # ── 网络 ──

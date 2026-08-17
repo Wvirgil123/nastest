@@ -40,19 +40,19 @@ _S3_RAID_LEVELS = ["RAID0", "RAID1", "RAID5", "RAID6", "RAID10"]
 # (序号, impl 键, 标题, 测试方法, 记录指标/判读)
 _S3_GROUP_TEMPLATES = [
     ("01", "s3_seq_read", "顺序读 1M QD32×4(峰值读)",
-     "fio rw=read bs=1M iodepth=32 numjobs=4 direct=1,热身+rounds 轮取中位数",
+     "fio rw=read bs=1M ioengine=libaio iodepth=32 numjobs=4 direct=1,热身+rounds 轮取中位数",
      "记录 MB/s、CPU%;文件>内存且 direct=1(§3.3)"),
     ("02", "s3_seq_write", "顺序写 1M QD32×4(峰值写)",
-     "fio rw=write bs=1M iodepth=32 numjobs=4 direct=1",
+     "fio rw=write bs=1M ioengine=libaio iodepth=32 numjobs=4 direct=1",
      "记录 MB/s、CPU%;RAID 写含奇偶校验开销,观察 CPU 是否瓶颈"),
     ("03", "s3_rand_read", "4K 随机读 QD32×4(IOPS)",
-     "fio rw=randread bs=4k iodepth=32 numjobs=4 direct=1",
+     "fio rw=randread bs=4k ioengine=libaio iodepth=32 numjobs=4 direct=1",
      "记录 IOPS、平均/P99 延迟"),
     ("04", "s3_rand_write", "4K 随机写 QD32×4(IOPS)",
-     "fio rw=randwrite bs=4k iodepth=32 numjobs=4 direct=1",
+     "fio rw=randwrite bs=4k ioengine=libaio iodepth=32 numjobs=4 direct=1",
      "记录 IOPS、平均/P99 延迟"),
     ("05", "s3_randrw", "4K 混合读写 70/30 QD64×4",
-     "fio rw=randrw rwmixread=70 bs=4k iodepth=64 numjobs=4 direct=1,"
+     "fio rw=randrw rwmixread=70 bs=4k ioengine=libaio iodepth=64 numjobs=4 direct=1,"
      "percentile_list=50:90:99:99.9",
      "记录混合 IOPS 与 P50/P90/P99/P99.9 延迟(典型负载)"),
     ("06", "s3_qd1_lat", "4K 随机读 QD1 最低延迟",
@@ -64,6 +64,13 @@ _S3_GROUP_TEMPLATES = [
     ("08", "s3_metadata", "元数据与小文件",
      "脚本计时:1 万文件 create/stat/read/delete(mdtest 无包,自研等价脚本)",
      "记录各阶段 files/s;小文件 IOPS 远低裸盘→FS/RAID 元数据开销(§8 红旗)"),
+    ("09", "s3_seq_read_1job", "顺序读 1M QD32×1(单流真实带宽)",
+     "fio rw=read bs=1M ioengine=libaio iodepth=32 numjobs=1 direct=1,热身+rounds 轮取中位数;"
+     "单流避免多 job 在机械盘上磁头交插(4job 曾仅 ~240MB/s,单流 libaio 可达 ~400MB/s)",
+     "记录 MB/s、CPU%;单流顺序读反映 RAID 真实顺序带宽(对比 01 的多流并发读)"),
+    ("10", "s3_seq_write_1job", "顺序写 1M QD32×1(单流真实带宽)",
+     "fio rw=write bs=1M ioengine=libaio iodepth=32 numjobs=1 direct=1",
+     "记录 MB/s、CPU%;单流顺序写真实带宽(对比 02 的多流并发写)"),
 ]
 
 
@@ -186,7 +193,7 @@ CASES: list[Case] = [
        expected="记录顺序/随机 MB/s 与 IOPS(虚拟化场景关键)",
        guide="1. 若 fnOS 提供 iSCSI 功能:在控制台创建 target 与 LUN,记录 IQN;\n"
              "2. 本机:iscsiadm -m discovery -t st -p <NAS_IP> && iscsiadm -m node --login;\n"
-             "3. 对 /dev/sdX 裸跑:fio --filename=/dev/sdX --rw=randread --bs=4k --iodepth=32 --direct=1 --runtime=60 --time_based;\n"
+             "3. 对 /dev/sdX 裸跑:fio --filename=/dev/sdX --rw=randread --bs=4k --ioengine=libaio --iodepth=32 --direct=1 --runtime=60 --time_based;\n"
              "4. 将结果填入备注或上传截图后提交判定。若设备不支持 iSCSI,判为跳过并注明。"),
     _c(id="S5-08", domain="S5", title="rsync 备份吞吐", mode="auto", impl="s5_rsync",
        steps="本机 rsync -a 大目录 → 设备(sshpass 认证)计时",

@@ -26,6 +26,8 @@ RAID_ORDER = ["RAID0", "RAID1", "RAID5", "RAID6", "RAID10"]
 _STORAGE_ROWS = [
     ("01", "顺序读", "1M / QD32 / 4jobs", "seq_read", "r"),
     ("02", "顺序写", "1M / QD32 / 4jobs", "seq_write", "w"),
+    ("09", "顺序读(单流)", "1M / QD32 / 1job", "seq_read_1job", "r"),
+    ("10", "顺序写(单流)", "1M / QD32 / 1job", "seq_write_1job", "w"),
     ("03", "4K 随机读", "4K / QD32 / 4jobs", "rand_read", "r"),
     ("04", "4K 随机写", "4K / QD32 / 4jobs", "rand_write", "w"),
     ("05", "4K 混合 70/30", "4K / QD64 / 4jobs", "randrw", "mixed"),
@@ -125,7 +127,7 @@ def storage_table(results: dict, cfg: dict) -> dict:
     """存储子系统表,按 RAID 子组分组(RAID0/1/5/6/10 各自一张子表)。
 
     返回 {"multi": bool, "levels": [{"raid":…, "rows":[…]}], "hint": str}。
-    - 子组编号 S3-<级别>-01..08 有数据:每个测过的 RAID 级别一张子表(扁平指标);
+    - 子组编号 S3-<级别>-01..10 有数据:每个测过的 RAID 级别一张子表(扁平指标);
     - 仅存旧版 raid_<级别>_ 命名空间数据(未迁移):按旧键回退渲染;
     - 全空:单张空表,RAID 标签取运行配置 raid_level。
     """
@@ -338,24 +340,25 @@ def methodology(cfg: dict) -> dict:
             "principle": [
                 "direct=1 + 文件>内存,确保测的是磁盘/RAID 真实性能而非内存缓存;",
                 "1M 大块顺序 IO 反映带宽上限(受盘顺序速率与 RAID 条带/奇偶校验开销制约);4K 随机 IO 反映 IOPS 与延迟(受寻道/队列深度制约);",
-                "iodepth×numjobs 把队列打满以逼出设备峰值;QD1 单队列给出最低延迟(单路径极限);fsync=1 测每次落盘提交延迟,是数据库类负载的关键指标;",
+                "iodepth×numjobs(libaio/io_uring 异步引擎生效)把队列打满以逼出设备峰值;QD1 单队列给出最低延迟(单路径极限);fsync=1 测每次落盘提交延迟,是数据库类负载的关键指标;",
                 "percentile(50/90/99/99.9)延迟用于暴露长尾;",
                 "CPU% 口径为设备整机利用率(/proc/stat 前后差值,含 RAID 奇偶校验、文件系统内核线程、"
                 "softirq 等内核态开销),用于判断算力是否先于存储成为瓶颈;"
                 "fio 自报 CPU 仅为其进程自身占用,已另存 fio_proc_cpu_pct 供参考,不作为报告 CPU%。",
             ],
             "commands": [
-                f"# 顺序读(S3-<RAID级别>-01),其余 profile 仅 --rw/--bs/--iodepth 不同\n"
+                f"# 顺序读(S3-<RAID级别>-01);框架自动选择异步引擎(libaio/io_uring),否则 sync 引擎会把 iodepth 压到 1\n"
                 f"fio --name=seq_read --directory={tdir} --size={size} --rw=read --bs=1M "
-                f"--iodepth=32 --numjobs=4 --direct=1 --time_based --runtime={rt} "
-                f"--group_reporting --output-format=json",
+                f"--ioengine=libaio --iodepth=32 --numjobs=4 --direct=1 "
+                f"--time_based --runtime={rt} --group_reporting --output-format=json",
                 f"# fsync 提交延迟(S3-<RAID级别>-07)\n"
                 f"fio --name=fsync_lat --directory={tdir} --size={size} --rw=write --bs=4k "
                 f"--iodepth=1 --numjobs=1 --direct=1 --fsync=1 --time_based --runtime={rt} "
                 f"--group_reporting --output-format=json",
                 f"# 裸盘读基线(S3-BASE-01,sdX 由 /proc/mdstat 自动识别,只读安全)\n"
                 f"fio --name=rawread --filename=/dev/sdX --rw=read --bs=128k "
-                f"--iodepth=32 --numjobs=1 --direct=1 --time_based --runtime={rt} --output-format=json",
+                f"--ioengine=libaio --iodepth=32 --numjobs=1 --direct=1 "
+                f"--time_based --runtime={rt} --output-format=json",
                 "# 每轮 fio 前后各打一次快照,差值 = 该轮设备整机 CPU%\n"
                 "head -1 /proc/stat",
             ],
@@ -419,7 +422,8 @@ def methodology(cfg: dict) -> dict:
                 f"# CPU 压力(后台)\nstress-ng --cpu $(nproc) --timeout {soak_secs}s --metrics-brief",
                 f"# 持续混合 IO(后台)\n"
                 f"fio --name=soak --directory={tdir} --size=1G --rw=randrw --rwmixread=70 "
-                f"--bs=4k --iodepth=32 --numjobs=4 --direct=1 --time_based --runtime={soak_secs}",
+                f"--bs=4k --ioengine=libaio --iodepth=32 --numjobs=4 --direct=1 "
+                f"--time_based --runtime={soak_secs}",
                 f"# 网络压力(本机 iperf3)\niperf3 -c {ip} -p {p0} -t {soak_secs}",
             ],
         },
