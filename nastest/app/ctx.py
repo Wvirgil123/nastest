@@ -582,6 +582,8 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
             vals = [c[i] for c in core_rounds if c[i] is not None]
             per_core.append(round(float(statistics.median(vals)), 1) if vals else None)
             ctx.metric(f"{key}_dev_cpu_core{i}_rounds", vals)
+        # 必须显式入库:fio_profile 的返回值 med 只用于拼串,不会自动进 metrics
+        ctx.metric(f"{key}_dev_cpu_per_core", per_core)
         med["dev_cpu_per_core"] = per_core
     ctx.sh(f"rm -f {tdir}/{key}.*", note="清理测试文件")
     if not any(med.get(k) for k in ("r_mbps", "w_mbps", "r_iops", "w_iops",
