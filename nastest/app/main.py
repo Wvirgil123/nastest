@@ -1,6 +1,7 @@
 """FastAPI Web 后台入口 —— ARM-NAS 极限性能测试框架。启动: python -m app.main"""
 import csv
 import json
+import re
 import shutil
 import threading
 import time
@@ -135,6 +136,16 @@ def attachment_file(run_id: int, case_id: str, fname: str):
     if not p.exists():
         raise HTTPException(404, "附件不存在")
     return FileResponse(p, filename=fname)
+
+
+@app.get("/runs/{run_id}/charts/{fname}")
+def chart_file(run_id: int, fname: str):
+    if not re.fullmatch(r"[\w.-]+\.png", fname):
+        raise HTTPException(404, "图表不存在")
+    p = evidence.run_dir(run_id) / "charts" / fname
+    if not p.exists():
+        raise HTTPException(404, "图表不存在")
+    return FileResponse(p, media_type="image/png")
 
 
 # ================= API =================

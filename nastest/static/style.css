@@ -32,6 +32,7 @@ h3 { margin: 12px 0 8px; }
 .footer { max-width: 1200px; margin: 30px auto; padding: 0 20px; color: var(--muted); font-size: 12px; }
 
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px 20px; margin-bottom: 18px; }
+.chart { max-width: 100%; height: auto; display: block; margin: 12px 0 4px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
 .page-head { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }

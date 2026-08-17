@@ -13,3 +13,6 @@ venv/
 nohup.out
 *.log
 .DS_Store
+
+# 生成的报告图表(gen_charts.py 产物,正式输出在 nastest/data/evidence 内)
+/charts/

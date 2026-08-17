@@ -8,7 +8,7 @@ import csv
 import time
 from pathlib import Path
 
-from . import config, db, evidence, raid
+from . import charts, config, db, evidence, raid
 from .registry import BY_ID, CASES
 from .scorer import score_run
 
@@ -480,7 +480,7 @@ def _render_storage_md(A, st: dict) -> None:
 
 
 # ---------------- 上下文与 Markdown ----------------
-def report_context(run_id: int) -> dict:
+def report_context(run_id: int, regen_charts: bool = False) -> dict:
     run = db.get_run(run_id)
     results = {r["case_id"]: r for r in db.list_results(run_id)}
     score = score_run(run_id)
@@ -504,6 +504,8 @@ def report_context(run_id: int) -> dict:
         },
         "method": methodology(run["config"]),
         "manual_rows": manual_guidance(results),
+        "charts": charts.generate_charts(run_id, results, run["config"],
+                                         force=regen_charts),
         "domains": config.DOMAIN_ORDER, "domain_names": config.DOMAIN_NAMES,
         "tier_cn": TIER_CN, "status_cn": STATUS_CN,
         "evidence_dir": f"data/evidence/run_{run_id}",
@@ -511,10 +513,16 @@ def report_context(run_id: int) -> dict:
 
 
 def generate_markdown(run_id: int) -> Path:
-    ctx = report_context(run_id)
+    ctx = report_context(run_id, regen_charts=True)
     run, cfg, score = ctx["run"], ctx["cfg"], ctx["score"]
     b = ctx["baseline"]
     T = ctx["tables"]
+    C = ctx["charts"]
+
+    def _embed(key: str, alt: str):
+        if key in C:
+            A(f"![{alt}](charts/{C[key]})")
+            A("")
     now = time.strftime("%Y-%m-%d %H:%M")
     L: list[str] = []
     A = L.append
@@ -563,6 +571,8 @@ def generate_markdown(run_id: int) -> Path:
     A("## 三、存储子系统(§5.3,中位数)")
     A("")
     _render_storage_md(A, T["storage"])
+    _embed("raid_seq", "各 RAID 级别顺序吞吐对比")
+    _embed("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")
     _render_method_md(A, ctx["method"].get("storage"))
 
     # ---- 协议表 ----
@@ -574,6 +584,8 @@ def generate_markdown(run_id: int) -> Path:
         A(f"| {r['proto']} | {r['load']} | {_fmt(r.get('mb_s'))} | {_fmt(r.get('iops'))} | "
           f"{_fmt(r.get('p99'))} | {_fmt(r.get('cpu'))} | {r.get('enc') or '—'} | {r.get('note') or ''} |")
     A("")
+    _embed("protocols", "文件协议读写吞吐横向对比")
+    _embed("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")
     _render_method_md(A, ctx["method"].get("protocol"))
 
     # ---- 并发表 ----
@@ -591,6 +603,7 @@ def generate_markdown(run_id: int) -> Path:
     else:
         A("(未执行 S6-01/S6-02)")
     A("")
+    _embed("scale", "并发扩展曲线")
     _render_method_md(A, ctx["method"].get("scale"))
 
     # ---- 浸泡小时表 ----
@@ -629,6 +642,7 @@ def generate_markdown(run_id: int) -> Path:
         A(f"- **{mark}** — {f['desc']}")
         A(f"  - {f['detail']}")
     A("")
+    _embed("crypto", "加密算法性能对比(openssl speed)")
 
     # ---- 人工项 ----
     if ctx["manual_rows"]:

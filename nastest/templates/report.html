@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}性能报告 · {{ run.name }}{% endblock %}
 {% block content %}
+{% set charts = charts | default({}) %}
 <div class="report-head">
   <div class="page-head">
     <h1>{{ run.name }} — ARM-NAS 极限性能报告</h1>
@@ -94,6 +95,10 @@
   </table>
   </div>
   {% endif %}
+  {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
+                      ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")] %}
+  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
+  {% endfor %}
   {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
 </section>
 
@@ -112,6 +117,10 @@
     </tbody>
   </table>
   </div>
+  {% for key, alt in [("protocols", "文件协议读写吞吐横向对比"),
+                      ("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")] %}
+  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
+  {% endfor %}
   {% with entry = method.protocol %}{% include "_method_block.html" %}{% endwith %}
 </section>
 
@@ -131,6 +140,7 @@
   </table>
   </div>
   {% if tables.scale_note %}<div class="small" style="margin-top:6px">{{ tables.scale_note }}</div>{% endif %}
+  {% if charts.get("scale") %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts['scale'] }}" alt="并发扩展曲线">{% endif %}
   {% else %}<div class="muted">未执行 S6-01/S6-02。</div>{% endif %}
   {% with entry = method.scale %}{% include "_method_block.html" %}{% endwith %}
 </section>
@@ -186,6 +196,7 @@
     <div class="small muted" style="margin-left:22px">{{ f.detail }}</div>
   </div>
   {% endfor %}
+  {% if charts.get("crypto") %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts['crypto'] }}" alt="加密算法性能对比(openssl speed)">{% endif %}
 </section>
 
 <!-- 人工项 -->
