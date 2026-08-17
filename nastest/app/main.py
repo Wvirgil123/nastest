@@ -27,6 +27,8 @@ templates = Jinja2Templates(directory=str(config.BASE_DIR / "templates"))
 
 # ---------- 重启恢复:把残留 running 置为 paused ----------
 for _r in db.list_runs():
+    # 注册表新增用例后,为旧任务补齐结果行(幂等),新用例显示为未测
+    db.ensure_results(_r["id"], [c.id for c in CASES])
     if _r["status"] == "running":
         db.update_run(_r["id"], status="paused",
                       note=(_r.get("note") or "") + "\n[服务重启,任务已暂停,可点击继续]")
@@ -95,6 +97,18 @@ def page_new(request: Request):
         "run_new.html", {"request": request, "defaults": config.DEFAULT_RUN_CONFIG})
 
 
+@app.get("/runs/{run_id}/config", response_class=HTMLResponse)
+def page_edit_config(request: Request, run_id: int):
+    run = db.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "任务不存在")
+    return templates.TemplateResponse(
+        "run_config.html",
+        {"request": request, "run_id": run_id, "run_name": run["name"],
+         # 旧任务可能缺新增的默认键,用默认值兜底
+         "defaults": {**config.DEFAULT_RUN_CONFIG, **run["config"]}})
+
+
 @app.get("/runs/{run_id}", response_class=HTMLResponse)
 def page_run(request: Request, run_id: int):
     run = db.get_run(run_id)
@@ -149,6 +163,30 @@ def chart_file(run_id: int, fname: str):
 
 
 # ================= API =================
+_INT_CFG_KEYS = ("disk_count", "ssh_port", "ftp_port", "rounds", "fio_runtime",
+                 "warmup_seconds", "soak_minutes", "soak_sample_interval",
+                 "nic_link_mbps", "smb_bigfile_mb")
+
+
+def _normalize_config(cfg: dict) -> dict:
+    """配置类型与字符串规整,新建/修改任务共用。"""
+    for k in ("volume_path", "device_test_dir"):
+        cfg[k] = str(cfg.get(k) or "").strip()
+    for k in _INT_CFG_KEYS:
+        try:
+            cfg[k] = int(cfg.get(k, 0))
+        except (TypeError, ValueError):
+            pass
+    ports = cfg.get("iperf_ports", [5201])
+    if isinstance(ports, str):
+        ports = ports.split(",")
+    try:
+        cfg["iperf_ports"] = [int(p) for p in ports]
+    except (TypeError, ValueError):
+        cfg["iperf_ports"] = [5201, 5202, 5203, 5204]
+    return cfg
+
+
 @app.post("/api/runs")
 async def api_create_run(request: Request):
     body = await request.json()
@@ -156,26 +194,48 @@ async def api_create_run(request: Request):
     cfg = dict(config.DEFAULT_RUN_CONFIG)
     cfg.update(body.get("config") or {})
     cfg["protocols"] = body.get("protocols") or cfg["protocols"]
+    cfg = _normalize_config(cfg)
     # 存储卷:留空=运行/预检时自动探测;测试目录未填则跟随卷推导
-    for k in ("volume_path", "device_test_dir"):
-        cfg[k] = str(cfg.get(k) or "").strip()
     if cfg["volume_path"] and not cfg["device_test_dir"]:
         cfg["device_test_dir"] = cfg["volume_path"].rstrip("/") + "/.nastest_perf"
-    for k in ("disk_count", "ssh_port", "ftp_port", "rounds", "fio_runtime",
-              "warmup_seconds", "soak_minutes", "soak_sample_interval",
-              "nic_link_mbps", "smb_bigfile_mb"):
-        try:
-            cfg[k] = int(cfg.get(k, 0))
-        except (TypeError, ValueError):
-            pass
-    try:
-        cfg["iperf_ports"] = [int(p) for p in cfg.get("iperf_ports", [5201])]
-    except (TypeError, ValueError):
-        cfg["iperf_ports"] = [5201, 5202, 5203, 5204]
     run_id = db.create_run(name, cfg)
     db.ensure_results(run_id, [c.id for c in CASES])
     evidence.save_run_meta(run_id, db.get_run(run_id))
     return {"run_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/config")
+async def api_update_config(run_id: int, request: Request):
+    """修改任务配置(可连带改名),对之后执行的用例生效,不影响已完成结果。
+
+    有用例正在执行或任务处于运行态时拒绝;保存后为注册表新增的用例补齐结果行,
+    并刷新证据目录 run.json。测试目录若为空或仍是旧卷的派生值,则跟随新卷重新推导。
+    """
+    run = db.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "任务不存在")
+    if run["status"] == "running" or any(
+            r["status"] == "running" for r in db.list_results(run_id)):
+        raise HTTPException(409, "任务正在运行,请先暂停或中止后再修改配置")
+    body = await request.json()
+    old_cfg = run["config"]
+    cfg = dict(old_cfg)
+    cfg.update(body.get("config") or {})
+    cfg["protocols"] = body.get("protocols") or cfg["protocols"]
+    cfg = _normalize_config(cfg)
+    old_vol = str(old_cfg.get("volume_path") or "").strip().rstrip("/")
+    if cfg["volume_path"] and (
+            not cfg["device_test_dir"]
+            or (old_vol and cfg["device_test_dir"] == old_vol + "/.nastest_perf")):
+        cfg["device_test_dir"] = cfg["volume_path"].rstrip("/") + "/.nastest_perf"
+    fields = {"config": cfg}
+    name = (body.get("name") or "").strip()
+    if name:
+        fields["name"] = name
+    db.update_run(run_id, **fields)
+    db.ensure_results(run_id, [c.id for c in CASES])   # 注册表新增用例补行(幂等)
+    evidence.save_run_meta(run_id, db.get_run(run_id))
+    return {"ok": True, "run_id": run_id}
 
 
 @app.get("/api/runs")
