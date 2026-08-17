@@ -36,10 +36,16 @@ _BLOCK = b"\xa5" * _CHUNK
 
 
 def _save_cpu(ctx: Ctx, key: str, pre: dict, post: dict) -> None:
-    """记录传输阶段内设备整机 CPU%(/proc/stat 快照差值)。"""
+    """记录传输阶段内设备整机 + 逐核 CPU%(/proc/stat 快照差值)。
+
+    逐核列表存 <key 去 cpu_pct>_cpu_per_core(如 write_cpu_pct →
+    write_cpu_per_core),报告用于识别大小核单核饱和。
+    """
     d = device_delta(pre, post)
     if d.get("cpu_pct") is not None:
         ctx.metric(key, d["cpu_pct"])
+    if d.get("cpu_per_core"):
+        ctx.metric(key.replace("cpu_pct", "cpu_per_core"), d["cpu_per_core"])
 
 
 def _smb_write_mb(path: str, mb: int) -> float:

@@ -350,11 +350,15 @@ def device_nic(ctx: Ctx) -> str:
 
 
 def device_snapshot(ctx: Ctx, nic: str | None = None) -> dict:
-    """静默采集 CPU/内存/网络计数,用于前后差值计算。"""
+    """静默采集 CPU(整机+逐核)/内存/网络计数,用于前后差值计算。
+
+    /proc/stat 的 cpu 聚合行 + cpu0..cpuN 逐核行一次带回(均为自开机
+    累计 jiffies);逐核数据用于识别大小核单核饱和(整机均值会掩盖)。
+    """
     nic = nic or "end0"
     try:
         r = ctx.ssh.run(
-            f"head -1 /proc/stat; echo @@; grep MemAvailable /proc/meminfo; echo @@; "
+            f"grep '^cpu' /proc/stat; echo @@; grep MemAvailable /proc/meminfo; echo @@; "
             f"cat /sys/class/net/{nic}/statistics/rx_bytes /sys/class/net/{nic}/statistics/tx_bytes",
             timeout=15)
     except SSHError:
@@ -363,19 +367,22 @@ def device_snapshot(ctx: Ctx, nic: str | None = None) -> dict:
     if len(sec) < 3:
         return {}
     try:
-        f = sec[0].strip().split()
+        lines = [ln.split() for ln in sec[0].strip().splitlines() if ln.strip()]
+        f = lines[0]                      # 聚合行 "cpu  user nice system idle ..."
         total = sum(int(x) for x in f[1:])
         idle = int(f[4])
+        cores = [(sum(int(x) for x in c[1:]), int(c[4]))
+                 for c in lines[1:] if c[0].startswith("cpu")]
         mem_kb = int(sec[1].split()[1])
         rx, tx = [int(x) for x in sec[2].split()]
-        return {"t": time.time(), "total": total, "idle": idle,
+        return {"t": time.time(), "total": total, "idle": idle, "cores": cores,
                 "mem_avail_mb": round(mem_kb / 1024), "rx": rx, "tx": tx}
     except (ValueError, IndexError):
         return {}
 
 
 def device_delta(a: dict, b: dict) -> dict:
-    """两次快照间的 CPU%/网络速率。"""
+    """两次快照间的 CPU%(整机+逐核)/网络速率。"""
     if not a or not b:
         return {}
     dt = max(b["t"] - a["t"], 0.001)
@@ -383,6 +390,13 @@ def device_delta(a: dict, b: dict) -> dict:
     out = {}
     if d_total > 0:
         out["cpu_pct"] = round(100.0 * (1 - (b["idle"] - a["idle"]) / d_total), 1)
+        ca, cb = a.get("cores") or [], b.get("cores") or []
+        if ca and len(ca) == len(cb):
+            per = []
+            for (t1, i1), (t2, i2) in zip(ca, cb):
+                d = t2 - t1
+                per.append(round(100.0 * (1 - (i2 - i1) / d), 1) if d > 0 else None)
+            out["cpu_per_core"] = per
     out["net_rx_mbps"] = round((b["rx"] - a["rx"]) / dt / 1e6, 1)
     out["net_tx_mbps"] = round((b["tx"] - a["tx"]) / dt / 1e6, 1)
     out["dt_s"] = round(dt, 1)
@@ -526,7 +540,7 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
         if r.rc != 0:
             ctx.abort("fail", f"热身 fio 失败 rc={r.rc}({key}):测试目录 {tdir} 不可用?"
                               f"常见原因:卷未挂载/不支持 direct=1/目录无写权限,详见 stdout.log")
-    per_round, raws, cpus = [], [], []
+    per_round, raws, cpus, core_rounds = [], [], [], []
     for i in range(n):
         if ctx.stop_requested():
             ctx.abort("fail", "用户中止")
@@ -536,6 +550,8 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
         delta = device_delta(pre, device_snapshot(ctx, nic))
         if delta.get("cpu_pct") is not None:
             cpus.append(delta["cpu_pct"])
+        if delta.get("cpu_per_core"):
+            core_rounds.append(delta["cpu_per_core"])
         if r.rc != 0:
             ctx.abort("fail", f"fio 运行失败 rc={r.rc}({key}) 第 {i + 1} 轮:"
                               f"测试目录 {tdir} 不可用?常见原因:卷未挂载/文件系统不支持"
@@ -559,6 +575,14 @@ def fio_profile(ctx: Ctx, key: str, runtime: int | None = None,
         med["mixed_iops"] = record_rounds(ctx, f"{key}_mixed_iops", mixed)
     if cpus:  # 设备整机 CPU%(/proc/stat 快照差值,含内核态),报告 CPU% 列以此为准
         med["dev_cpu_pct"] = record_rounds(ctx, f"{key}_dev_cpu_pct", cpus)
+    if core_rounds:  # 逐核 CPU% 各轮中位数(识别大小核单核饱和;不做波动告警,
+        ncore = min(len(c) for c in core_rounds)  # 空闲核占比小,相对波动天然大)
+        per_core = []
+        for i in range(ncore):
+            vals = [c[i] for c in core_rounds if c[i] is not None]
+            per_core.append(round(float(statistics.median(vals)), 1) if vals else None)
+            ctx.metric(f"{key}_dev_cpu_core{i}_rounds", vals)
+        med["dev_cpu_per_core"] = per_core
     ctx.sh(f"rm -f {tdir}/{key}.*", note="清理测试文件")
     if not any(med.get(k) for k in ("r_mbps", "w_mbps", "r_iops", "w_iops",
                                     "fsync_lat_us")):
@@ -589,6 +613,8 @@ def fio_local(ctx: Ctx, key: str, directory: str, runtime: int | None = None,
     delta = device_delta(pre, device_snapshot(ctx, nic))
     if delta.get("cpu_pct") is not None:
         ctx.metric(f"{key}_dev_cpu_pct", delta["cpu_pct"])
+    if delta.get("cpu_per_core"):
+        ctx.metric(f"{key}_dev_cpu_per_core", delta["cpu_per_core"])
     if r.rc != 0:
         ctx.abort("fail", f"本机 fio 运行失败 rc={r.rc}")
     try:

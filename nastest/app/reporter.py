@@ -71,6 +71,22 @@ def _cpu(m: dict, prefix: str):
     return v if v is not None else _m(m, f"{prefix}_fio_cpu_pct")
 
 
+def _lst(m: dict, key: str):
+    """数值列表指标(如逐核 CPU%);非列表/空/含非数值非 None 元素返回 None。"""
+    v = m.get(key)
+    if isinstance(v, list) and v and \
+            all(x is None or isinstance(x, (int, float)) for x in v):
+        return v
+    return None
+
+
+def _fmt_cores(v):
+    """逐核 CPU% 列表 → '85.2/12/…'(按 c0..cN-1 顺序,%g 紧凑格式);无数据为 —。"""
+    if not v:
+        return "—"
+    return "/".join("—" if x is None else format(x, "g") for x in v)
+
+
 # ---------------- 表格组装 ----------------
 def _raid_levels(results: dict) -> list[str]:
     """汇总所有 S3 用例实际测过的 RAID 级别(按 RAID0/1/5/6/10 排序)。"""
@@ -97,8 +113,9 @@ def _has_raid_keys(results: dict) -> bool:
 
 
 def _storage_row(m: dict, cid: str, name: str, spec: str, prefix: str,
-                 side: str, raid: str, keyfn) -> dict:
-    """按 keyfn(指标 key) 取值;keyfn 决定读 raid_<级别>_ 前缀还是主指标。"""
+                 side: str, raid: str, keyfn, getraw=None) -> dict:
+    """按 keyfn(指标 key) 取值;keyfn 决定读 raid_<级别>_ 前缀还是主指标。
+    getraw 取原始值(列表类指标,如逐核 CPU%)。"""
     if side == "mixed":
         mb_s = None
         rmb, wmb = keyfn(f"{prefix}_r_mbps"), keyfn(f"{prefix}_w_mbps")
@@ -111,12 +128,14 @@ def _storage_row(m: dict, cid: str, name: str, spec: str, prefix: str,
     cpu = keyfn(f"{prefix}_dev_cpu_pct")   # 整机 CPU%(/proc/stat 快照)优先
     if cpu is None:                        # 旧数据无此键时回退 fio 自报值
         cpu = keyfn(f"{prefix}_fio_cpu_pct")
+    cores = getraw(f"{prefix}_dev_cpu_per_core") if getraw else None
     return {
         "case_id": cid, "case": name, "spec": spec, "raid": raid,
         "mb_s": mb_s, "iops": iops,
         "p50": keyfn(f"{prefix}_{side}_p50_us"),
         "p99": keyfn(f"{prefix}_{side}_p99_us"),
         "cpu": cpu,
+        "cpu_cores": _fmt_cores(cores),
         "note": ("fsync 延迟 "
                  f"{_fmt(keyfn(f'{prefix}_fsync_lat_us'), 'μs')}"
                  if prefix == "fsync_lat" else ""),
@@ -146,7 +165,8 @@ def storage_table(results: dict, cfg: dict) -> dict:
                                  "raid": lv, "empty": True})
                     continue
                 rows.append(_storage_row(m, cid, name, spec, prefix, side, lv,
-                                         lambda k, m=m: _m(m, k)))
+                                         lambda k, m=m: _m(m, k),
+                                         getraw=lambda k, m=m: _lst(m, k)))
             out_levels.append({"raid": lv, "rows": rows})
         return {"multi": len(out_levels) > 1, "levels": out_levels,
                 "hint": ("每个 RAID 子组一张子表。切换阵列级别后运行对应 RAID 组的"
@@ -160,7 +180,8 @@ def storage_table(results: dict, cfg: dict) -> dict:
                 m = _metrics(results, cid)
                 rows.append(_storage_row(
                     m, cid, name, spec, prefix, side, lv,
-                    lambda k, m=m, lv=lv: _m(m, f"raid_{lv}_{k}")))
+                    lambda k, m=m, lv=lv: _m(m, f"raid_{lv}_{k}"),
+                    getraw=lambda k, m=m, lv=lv: _lst(m, f"raid_{lv}_{k}")))
             out_levels.append({"raid": lv, "rows": rows})
         return {"multi": True, "levels": out_levels, "hint": "(旧版累计数据)"}
     # 全空:占位单表
@@ -173,39 +194,50 @@ def storage_table(results: dict, cfg: dict) -> dict:
 def protocol_table(results: dict) -> list[dict]:
     R: list[dict] = []
 
-    def add(proto, load, mb_s=None, iops=None, p99=None, cpu=None, enc="", note=""):
+    def add(proto, load, mb_s=None, iops=None, p99=None, cpu=None, enc="", note="",
+            cpu_cores=None):
         R.append({"proto": proto, "load": load, "mb_s": mb_s, "iops": iops,
-                  "p99": p99, "cpu": cpu, "enc": enc, "note": note})
+                  "p99": p99, "cpu": cpu, "cpu_cores": _fmt_cores(cpu_cores),
+                  "enc": enc, "note": note})
 
     s51 = _metrics(results, "S5-01")
     add("SMB 纯软件", "大文件写", _m(s51, "write_mbps"),
-        cpu=_m(s51, "write_cpu_pct"), enc="否")
+        cpu=_m(s51, "write_cpu_pct"), cpu_cores=_lst(s51, "write_cpu_per_core"), enc="否")
     add("SMB 纯软件", "大文件读", _m(s51, "read_mbps"),
-        cpu=_m(s51, "read_cpu_pct"), enc="否")
+        cpu=_m(s51, "read_cpu_pct"), cpu_cores=_lst(s51, "read_cpu_per_core"), enc="否")
     s52 = _metrics(results, "S5-02")
     add("SMB seal", "大文件写", _m(s52, "seal_write_mbps"),
-        cpu=_m(s52, "seal_write_cpu_pct"), enc="是",
+        cpu=_m(s52, "seal_write_cpu_pct"),
+        cpu_cores=_lst(s52, "seal_write_cpu_per_core"), enc="是",
         note=f"较明文损失 {_fmt(_m(s52, 'encrypt_loss_write_pct'), '%')}")
     add("SMB seal", "大文件读", _m(s52, "seal_read_mbps"),
-        cpu=_m(s52, "seal_read_cpu_pct"), enc="是",
+        cpu=_m(s52, "seal_read_cpu_pct"),
+        cpu_cores=_lst(s52, "seal_read_cpu_per_core"), enc="是",
         note=f"较明文损失 {_fmt(_m(s52, 'encrypt_loss_read_pct'), '%')}")
     for cid, proto in (("S5-03", "SMB 挂载"), ("S5-04", "NFS 挂载")):
         m = _metrics(results, cid)
         add(proto, "fio 顺序写", _m(m, "seq_write_w_mbps"),
             cpu=_cpu(m, "seq_write"),
+            cpu_cores=_lst(m, "seq_write_dev_cpu_per_core"),
             note="(direct=0 回退,含客户端缓存)" if m.get("direct_fallback") else "")
         add(proto, "fio 顺序读", _m(m, "seq_read_r_mbps"),
-            cpu=_cpu(m, "seq_read"))
-        add(proto, "fio 混合 IOPS", None, iops=_m(m, "randrw_mixed_iops"))
+            cpu=_cpu(m, "seq_read"),
+            cpu_cores=_lst(m, "seq_read_dev_cpu_per_core"))
+        add(proto, "fio 混合 IOPS", None, iops=_m(m, "randrw_mixed_iops"),
+            cpu_cores=_lst(m, "randrw_dev_cpu_per_core"))
     s55 = _metrics(results, "S5-05")
-    add("FTP", "上传", _m(s55, "upload_mbps"), cpu=_m(s55, "upload_cpu_pct"))
-    add("FTP", "下载", _m(s55, "download_mbps"), cpu=_m(s55, "download_cpu_pct"))
+    add("FTP", "上传", _m(s55, "upload_mbps"), cpu=_m(s55, "upload_cpu_pct"),
+        cpu_cores=_lst(s55, "upload_cpu_per_core"))
+    add("FTP", "下载", _m(s55, "download_mbps"), cpu=_m(s55, "download_cpu_pct"),
+        cpu_cores=_lst(s55, "download_cpu_per_core"))
     s56 = _metrics(results, "S5-06")
-    add("WebDAV", "PUT", _m(s56, "upload_mbps"), cpu=_m(s56, "upload_cpu_pct"))
-    add("WebDAV", "GET", _m(s56, "download_mbps"), cpu=_m(s56, "download_cpu_pct"))
+    add("WebDAV", "PUT", _m(s56, "upload_mbps"), cpu=_m(s56, "upload_cpu_pct"),
+        cpu_cores=_lst(s56, "upload_cpu_per_core"))
+    add("WebDAV", "GET", _m(s56, "download_mbps"), cpu=_m(s56, "download_cpu_pct"),
+        cpu_cores=_lst(s56, "download_cpu_per_core"))
     s58 = _metrics(results, "S5-08")
     add("rsync(SSH)", "备份推送", _m(s58, "rsync_mbps"),
-        cpu=_m(s58, "rsync_cpu_pct"),
+        cpu=_m(s58, "rsync_cpu_pct"), cpu_cores=_lst(s58, "rsync_cpu_per_core"),
         note="含 SSH 加密开销")
     s59 = _metrics(results, "S5-09")
     if s59:
@@ -344,6 +376,8 @@ def methodology(cfg: dict) -> dict:
                 "percentile(50/90/99/99.9)延迟用于暴露长尾;",
                 "CPU% 口径为设备整机利用率(/proc/stat 前后差值,含 RAID 奇偶校验、文件系统内核线程、"
                 "softirq 等内核态开销),用于判断算力是否先于存储成为瓶颈;"
+                "另附逐核 CPU%(按 c0..cN-1 顺序),用于识别大小核架构下的单核饱和"
+                "(整机均值可能掩盖单核瓶颈);"
                 "fio 自报 CPU 仅为其进程自身占用,已另存 fio_proc_cpu_pct 供参考,不作为报告 CPU%。",
             ],
             "commands": [
@@ -359,8 +393,8 @@ def methodology(cfg: dict) -> dict:
                 f"fio --name=rawread --filename=/dev/sdX --rw=read --bs=128k "
                 f"--ioengine=libaio --iodepth=32 --numjobs=1 --direct=1 "
                 f"--time_based --runtime={rt} --output-format=json",
-                "# 每轮 fio 前后各打一次快照,差值 = 该轮设备整机 CPU%\n"
-                "head -1 /proc/stat",
+                "# 每轮 fio 前后各打一次快照(聚合行+逐核行),差值 = 该轮整机与逐核 CPU%\n"
+                "grep '^cpu' /proc/stat",
             ],
         },
         "protocol": {
@@ -463,23 +497,23 @@ def _render_storage_md(A, st: dict) -> None:
         for lv in st["levels"]:
             A(f"### {lv['raid']}")
             A("")
-            A("| 用例 | bs/QD/jobs | 吞吐(MB/s) | IOPS | P50(μs) | P99(μs) | CPU% | 备注 |")
-            A("|---|---|---|---|---|---|---|---|")
+            A("| 用例 | bs/QD/jobs | 吞吐(MB/s) | IOPS | P50(μs) | P99(μs) | CPU% | 逐核 CPU%(c0..) | 备注 |")
+            A("|---|---|---|---|---|---|---|---|---|")
             for r in lv["rows"]:
                 A(f"| {r['case']} | {r['spec']} | {_fmt(r.get('mb_s'))} | "
                   f"{_fmt(r.get('iops'))} | {_fmt(r.get('p50'))} | {_fmt(r.get('p99'))} | "
-                  f"{_fmt(r.get('cpu'))} | {r.get('note') or ''} |")
+                  f"{_fmt(r.get('cpu'))} | {r.get('cpu_cores') or '—'} | {r.get('note') or ''} |")
             A("")
     else:
-        A("| RAID | 用例 | bs/QD/jobs | 吞吐(MB/s) | IOPS | P50(μs) | P99(μs) | CPU% | 备注 |")
-        A("|---|---|---|---|---|---|---|---|---|")
+        A("| RAID | 用例 | bs/QD/jobs | 吞吐(MB/s) | IOPS | P50(μs) | P99(μs) | CPU% | 逐核 CPU%(c0..) | 备注 |")
+        A("|---|---|---|---|---|---|---|---|---|---|")
         for r in st["levels"][0]["rows"]:
             if r.get("empty"):
-                A(f"| {r['raid']} | {r['case']} | {r['spec']} | — | — | — | — | — | 未测 |")
+                A(f"| {r['raid']} | {r['case']} | {r['spec']} | — | — | — | — | — | — | 未测 |")
                 continue
             A(f"| {r['raid']} | {r['case']} | {r['spec']} | {_fmt(r.get('mb_s'))} | "
               f"{_fmt(r.get('iops'))} | {_fmt(r.get('p50'))} | {_fmt(r.get('p99'))} | "
-              f"{_fmt(r.get('cpu'))} | {r.get('note') or ''} |")
+              f"{_fmt(r.get('cpu'))} | {r.get('cpu_cores') or '—'} | {r.get('note') or ''} |")
         A("")
 
 
@@ -582,11 +616,12 @@ def generate_markdown(run_id: int) -> Path:
     # ---- 协议表 ----
     A("## 四、文件协议(§5.5)")
     A("")
-    A("| 协议 | 负载 | 吞吐(MB/s) | IOPS | P99(μs) | CPU% | 加密 | 备注 |")
-    A("|---|---|---|---|---|---|---|---|")
+    A("| 协议 | 负载 | 吞吐(MB/s) | IOPS | P99(μs) | CPU% | 逐核 CPU%(c0..) | 加密 | 备注 |")
+    A("|---|---|---|---|---|---|---|---|---|")
     for r in T["protocol"]:
         A(f"| {r['proto']} | {r['load']} | {_fmt(r.get('mb_s'))} | {_fmt(r.get('iops'))} | "
-          f"{_fmt(r.get('p99'))} | {_fmt(r.get('cpu'))} | {r.get('enc') or '—'} | {r.get('note') or ''} |")
+          f"{_fmt(r.get('p99'))} | {_fmt(r.get('cpu'))} | {r.get('cpu_cores') or '—'} | "
+          f"{r.get('enc') or '—'} | {r.get('note') or ''} |")
     A("")
     _embed("protocols", "文件协议读写吞吐横向对比")
     _embed("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")
