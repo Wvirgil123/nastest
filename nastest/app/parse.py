@@ -66,8 +66,8 @@ def parse_fio_json_jobs(text: str, side: str) -> list[float]:
     """多 job fio(裸盘并发测试每盘一个 job):按 jobs 数组顺序返回每个 job 的带宽 MB/s。
 
     parse_fio_json 只取 jobs[0],适用于单 job/同名合并的场景;裸盘并发用例
-    每块盘一个 --name/--filename,--group_reporting 仅按同名聚合,不同名各自
-    独立报告,故 jobs 数组每盘一条,逐个取出用于「每盘速度 + 合计」。
+    每块盘一个 --name/--filename 且不加 --group_reporting(它会合并全部 job),
+    故 jobs 数组每盘一条,逐个取出用于「每盘速度 + 合计」。
     """
     data = _extract_json(text)
     jobs = data.get("jobs") or []

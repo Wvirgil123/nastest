@@ -435,9 +435,10 @@ def methodology(cfg: dict) -> dict:
                 f"--ioengine=libaio --iodepth=32 --numjobs=1 --direct=1 "
                 f"--time_based --runtime={rt} --output-format=json",
                 "# 裸盘全盘并发(S3-BASE-03 读 / S3-BASE-04 写):每盘一个 job 独立报告,"
-                "每轮 30s;写用例破坏数据,拒跑在用盘\n"
+                "每轮 30s;不加 --group_reporting(会把全部 job 合并成单条);"
+                "写用例破坏数据,拒跑在用盘\n"
                 "sudo fio --rw=read --bs=1M --size=1G --ioengine=libaio --iodepth=4 --direct=1 "
-                "--time_based --runtime=30 --group_reporting --output-format=json "
+                "--time_based --runtime=30 --output-format=json "
                 "--name=d1 --filename=/dev/sda --name=d2 --filename=/dev/sdb "
                 "--name=d3 --filename=/dev/sdc --name=d4 --filename=/dev/sdd\n"
                 "# 写用例(S3-BASE-04)仅将 --rw=read 改为 --rw=write,其余参数相同",

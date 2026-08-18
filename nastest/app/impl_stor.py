@@ -208,8 +208,9 @@ def s3_raw_read(ctx: Ctx) -> str:
 
 
 # ---- 全盘并发裸盘读写(S3-BASE-03 读 / S3-BASE-04 写) ----
-# 命令形态对齐手工基准:每盘一个 job,bs=1M QD4 size=1G,runtime 30s×rounds 取中位数;
-# fio 各盘独立报告(不同 --name 不被 group_reporting 合并),指标记录每盘速度+合计。
+# 命令形态对齐手工基准:每盘一个 job,bs=1M QD4 size=1G,runtime 30s×rounds 取中位数。
+# 注意:不能用 --group_reporting(它会把全部 job 合并成单条报告,实测 fio-3.33
+# 下 4 个 --name 只回 1 条),去掉后 jobs 数组每盘一条,指标记录每盘速度+合计。
 _RAW_RUNTIME = 30
 _RAW_SIZE_ALL = "1G"    # 并发时每盘工作区(direct=1 直通,不经缓存)
 
@@ -263,8 +264,8 @@ def _raw_disk_test(ctx: Ctx, rw: str) -> str:
     """rw=read/write:全盘并发读/写(每盘一个 job),rounds 轮取中位数。
 
     命令形态对齐手工基准:fio --rw=<rw> --bs=1M --size=1G --iodepth=4 --direct=1
-    --time_based --runtime=30 --group_reporting,每盘一个 --name/--filename。
-    fio 各盘独立报告,指标同时记录每盘速度与并发合计。
+    --time_based --runtime=30,每盘一个 --name/--filename(不加 --group_reporting,
+    否则全部 job 被合并成单条报告,无法按盘取数)。
     """
     require_device_tool(ctx, "fio")
     engine = _pick_fio_engine(ctx)
@@ -298,7 +299,7 @@ def _raw_disk_test(ctx: Ctx, rw: str) -> str:
     jobs = " ".join(f"--name=d{i + 1} --filename={d}" for i, d in enumerate(disks))
     cmd = (f"fio --rw={rw} --bs=1M --size={_RAW_SIZE_ALL} --ioengine={engine} "
            f"--iodepth=4 --direct=1 --time_based --runtime={_RAW_RUNTIME} "
-           f"--group_reporting --output-format=json {jobs}")
+           f"--output-format=json {jobs}")
     per_round: dict[str, list[float]] = {n: [] for n in names}
     totals, cpus, core_rounds = [], [], []
     for i in range(rounds(ctx)):
