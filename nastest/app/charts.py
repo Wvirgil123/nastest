@@ -11,6 +11,7 @@ HTML 报告经 /runs/<id>/charts/<fname> 路由提供。
   04_scale       并发扩展曲线(读/写聚合吞吐)    (§5.6)
   05_protocols   文件协议读写吞吐横向对比        (§5.5)
   06_crypto      加密算法性能对比(openssl speed)(§5.1 / §8 AES 红旗)
+  07_raw_vs_raid 裸盘并发与各 RAID 级别顺序读写对比 (§5.3)
 """
 import json
 
@@ -25,6 +26,7 @@ CHART_FILES = {
     "scale": "04_scale.png",
     "protocols": "05_protocols.png",
     "crypto": "06_crypto.png",
+    "raw_vs_raid": "07_raw_vs_raid.png",
 }
 
 # 调色板(色盲安全、专业克制)
@@ -309,6 +311,61 @@ def _draw_protocols(path, plt, series):
     return True
 
 
+def _raw_vs_raid_series(results: dict):
+    """[(类别名, 顺序读 MB/s, 顺序写 MB/s)]:裸盘并发 + 各 RAID 级别,未测为 None。
+
+    裸盘并发读/写取 S3-BASE-03/04 合计值;阵列在役时裸盘写会被拒跑,
+    此时写为 None,绘图端按单侧数据处理。
+    """
+    rows = []
+    m3 = (results.get("S3-BASE-03") or {}).get("metrics") or {}
+    m4 = (results.get("S3-BASE-04") or {}).get("metrics") or {}
+    disks = m3.get("raw_read_disks") or m4.get("raw_write_disks") or []
+    raw_r = _m(results, "S3-BASE-03", "raw_read_all_mb_s")
+    raw_w = _m(results, "S3-BASE-04", "raw_write_all_mb_s")
+    if raw_r is not None or raw_w is not None:
+        rows.append((f"裸盘并发({len(disks)} 盘)" if disks else "裸盘并发",
+                     raw_r, raw_w))
+    for lv in RAID_ORDER:
+        r = _m(results, raid.level_case(lv, "01"), "seq_read_r_mbps")
+        w = _m(results, raid.level_case(lv, "02"), "seq_write_w_mbps")
+        if r is not None or w is not None:
+            rows.append((lv, r, w))
+    return rows
+
+
+def _draw_raw_vs_raid(path, plt, series):
+    import numpy as np
+    rows = [(n, r, w) for n, r, w in series if r is not None or w is not None]
+    if not rows:
+        return False
+    cats = [n for n, _, _ in rows]
+    rd = [r or 0 for _, r, _ in rows]
+    wr = [w or 0 for _, _, w in rows]
+    x = np.arange(len(cats))
+    bw = 0.36
+    fig, ax = plt.subplots(figsize=(max(8.4, 1.4 * len(cats) + 3.0), 4.6), dpi=160)
+    b1 = ax.bar(x - bw / 2, rd, bw, label="顺序读", color=C_BLUE, zorder=3)
+    b2 = ax.bar(x + bw / 2, wr, bw, label="顺序写", color=C_ORANGE, zorder=3)
+    for bars, raw in ((b1, [r for _, r, _ in rows]), (b2, [w for _, _, w in rows])):
+        for b, v in zip(bars, raw):
+            if v is not None:
+                ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 2,
+                        f"{v:.1f}", ha="center", va="bottom", fontsize=9,
+                        color=C_TEXT, fontweight="bold")
+    ax.set_xticks(x)
+    ax.set_xticklabels(cats, fontsize=10.5, color=C_TEXT)
+    ax.set_ylabel("吞吐 (MB/s)", color=C_MUTED, fontsize=11)
+    _title(ax, "裸盘并发 vs 各 RAID 级别:顺序读/写吞吐 (1M / direct)")
+    ax.legend(frameon=False, fontsize=10, loc="upper right")
+    ax.set_ylim(0, max(rd + wr) * 1.18)
+    _style_ax(ax)
+    fig.tight_layout()
+    fig.savefig(path, facecolor=C_BG)
+    plt.close(fig)
+    return True
+
+
 def _draw_crypto(path, plt, series, line_mb):
     import numpy as np
     rows = [(n, v) for n, v in series if v is not None]
@@ -391,6 +448,8 @@ def generate_charts(run_id: int, results: dict, cfg: dict, force: bool = False) 
         out / CHART_FILES["scale"], plt, wpts, rpts, infl_w, infl_r))
     try_draw("protocols", lambda: _draw_protocols(
         out / CHART_FILES["protocols"], plt, _protocol_series(results)))
+    try_draw("raw_vs_raid", lambda: _draw_raw_vs_raid(
+        out / CHART_FILES["raw_vs_raid"], plt, _raw_vs_raid_series(results)))
     try_draw("crypto", lambda: _draw_crypto(
         out / CHART_FILES["crypto"], plt, _crypto_series(results), line_mb))
 

@@ -62,27 +62,21 @@ def parse_fio_json(text: str) -> dict:
     return out
 
 
-def parse_fio_json_multi(text: str) -> dict:
-    """多 job fio(每盘一个 job 的裸盘并发测试):汇总全部 job 的带宽/IOPS。
+def parse_fio_json_jobs(text: str, side: str) -> list[float]:
+    """多 job fio(裸盘并发测试每盘一个 job):按 jobs 数组顺序返回每个 job 的带宽 MB/s。
 
-    parse_fio_json 只取 jobs[0],适用于单 job/group_reporting 合并的场景;
-    裸盘并发用例 N 个 --name/--filename 各自独立报告,需求和。
+    parse_fio_json 只取 jobs[0],适用于单 job/同名合并的场景;裸盘并发用例
+    每块盘一个 --name/--filename,--group_reporting 仅按同名聚合,不同名各自
+    独立报告,故 jobs 数组每盘一条,逐个取出用于「每盘速度 + 合计」。
     """
     data = _extract_json(text)
     jobs = data.get("jobs") or []
     if not jobs:
         raise ValueError("fio JSON 无 jobs")
-    out: dict = {}
-    for side in ("read", "write"):
-        bw = sum((j.get(side) or {}).get("bw") or 0 for j in jobs)
-        iops = sum((j.get(side) or {}).get("iops") or 0 for j in jobs)
-        if bw > 0:
-            key = side[:1]
-            out[f"{key}_mbps"] = round(bw / 1024.0, 2)
-            out[f"{key}_iops"] = round(iops, 1)
-    if not out:
-        raise ValueError("fio JSON 各 job 均无读/写带宽")
-    return out
+    vals = [round(((j.get(side) or {}).get("bw") or 0) / 1024.0, 2) for j in jobs]
+    if not any(v > 0 for v in vals):
+        raise ValueError(f"fio JSON 各 job 均无 {side} 带宽")
+    return vals
 
 
 def parse_fio_fsync(text: str) -> dict:

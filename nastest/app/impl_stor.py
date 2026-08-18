@@ -1,7 +1,6 @@
 """S3 存储子系统 / S4 网络层 用例实现。"""
 import re
 import statistics
-import time
 
 from . import db
 from .ctx import (Ctx, _pick_fio_engine, device_delta, device_nic,
@@ -9,7 +8,7 @@ from .ctx import (Ctx, _pick_fio_engine, device_delta, device_nic,
                   iperf_local, iperf_multi_local, iperf_servers, record_rounds,
                   require_device_tool, require_local_sudo, require_local_tool,
                   rounds)
-from .parse import parse_fio_json, parse_fio_json_multi
+from .parse import parse_fio_json, parse_fio_json_jobs
 
 IMPL: dict[str, callable] = {}
 
@@ -208,12 +207,11 @@ def s3_raw_read(ctx: Ctx) -> str:
             f"(用于计算 FS 层损耗与 RAID 效率,§5.3)")
 
 
-# ---- 裸盘逐盘 + 全盘并发读写(S3-BASE-03/04) ----
-# 参数对齐常用手工基准:单盘 bs=1M QD8 size=2G,并发每盘一个 job QD4 size=1G;
-# 裸盘顺序吞吐非常稳定,单轮 30s + rounds 轮中位数足够,避免占用整盘过久。
+# ---- 全盘并发裸盘读写(S3-BASE-03 读 / S3-BASE-04 写) ----
+# 命令形态对齐手工基准:每盘一个 job,bs=1M QD4 size=1G,runtime 30s×rounds 取中位数;
+# fio 各盘独立报告(不同 --name 不被 group_reporting 合并),指标记录每盘速度+合计。
 _RAW_RUNTIME = 30
-_RAW_SIZE_ONE = "2G"    # 单盘测试工作区(direct=1 直通,不经缓存)
-_RAW_SIZE_ALL = "1G"    # 并发时每盘工作区
+_RAW_SIZE_ALL = "1G"    # 并发时每盘工作区(direct=1 直通,不经缓存)
 
 
 def _detect_raw_disks(ctx: Ctx) -> list[str]:
@@ -262,13 +260,17 @@ def _used_parts(ctx: Ctx, dev: str) -> list[str]:
 
 
 def _raw_disk_test(ctx: Ctx, rw: str) -> str:
-    """rw=read/write:逐盘 fio + 全盘并发 fio,各 rounds 轮取中位数。"""
+    """rw=read/write:全盘并发读/写(每盘一个 job),rounds 轮取中位数。
+
+    命令形态对齐手工基准:fio --rw=<rw> --bs=1M --size=1G --iodepth=4 --direct=1
+    --time_based --runtime=30 --group_reporting,每盘一个 --name/--filename。
+    fio 各盘独立报告,指标同时记录每盘速度与并发合计。
+    """
     require_device_tool(ctx, "fio")
     engine = _pick_fio_engine(ctx)
     disks = _detect_raw_disks(ctx)
     prefix = "raw_read" if rw == "read" else "raw_write"
     cn = "读" if rw == "read" else "写"
-    side = rw[0]
 
     if rw == "write":
         members = _md_member_devs(ctx)
@@ -288,35 +290,16 @@ def _raw_disk_test(ctx: Ctx, rw: str) -> str:
                       "或改跑只读的 S3-BASE-03")
         ctx.log(f"[⚠ 破坏性操作] 将向每块裸盘头部区域写入({prefix}),"
                 f"盘上数据将全部失效")
-    ctx.metric(f"{prefix}_disks", [d.rsplit("/", 1)[-1] for d in disks])
+    names = [d.rsplit("/", 1)[-1] for d in disks]
+    ctx.metric(f"{prefix}_disks", names)
 
-    # 逐盘
-    per_disk: dict[str, float] = {}
-    for d in disks:
-        name = d.rsplit("/", 1)[-1]
-        vals = []
-        for i in range(rounds(ctx)):
-            if ctx.stop_requested():
-                ctx.abort("fail", "用户中止")
-            r = ctx.sh(f"fio --name={prefix}_{name} --filename={d} --rw={rw} --bs=1M "
-                       f"--size={_RAW_SIZE_ONE} --ioengine={engine} --iodepth=8 "
-                       f"--direct=1 --time_based --runtime={_RAW_RUNTIME} "
-                       f"--output-format=json", timeout=_RAW_RUNTIME + 300,
-                       sudo=True, note=f"裸盘{cn} {name} 第 {i + 1} 轮")
-            if r.rc != 0:
-                ctx.abort("fail", f"{d} 裸盘 fio 失败 rc={r.rc}(详见 stdout.log)")
-            try:
-                vals.append(parse_fio_json(r.out)[f"{side}_mbps"])
-            except (ValueError, KeyError):
-                ctx.abort("fail", f"{d} 裸盘 fio 解析失败(输出见 stdout.log)")
-        per_disk[name] = record_rounds(ctx, f"{prefix}_{name}_mb_s", vals)
-
-    # 全盘并发(每盘一个 job)
+    # 全盘并发:每盘一个 job,rounds 轮汇总每盘速度与合计
     nic = device_nic(ctx)
     jobs = " ".join(f"--name=d{i + 1} --filename={d}" for i, d in enumerate(disks))
     cmd = (f"fio --rw={rw} --bs=1M --size={_RAW_SIZE_ALL} --ioengine={engine} "
            f"--iodepth=4 --direct=1 --time_based --runtime={_RAW_RUNTIME} "
            f"--group_reporting --output-format=json {jobs}")
+    per_round: dict[str, list[float]] = {n: [] for n in names}
     totals, cpus, core_rounds = [], [], []
     for i in range(rounds(ctx)):
         if ctx.stop_requested():
@@ -332,9 +315,18 @@ def _raw_disk_test(ctx: Ctx, rw: str) -> str:
         if r.rc != 0:
             ctx.abort("fail", f"全盘并发 fio 失败 rc={r.rc}(详见 stdout.log)")
         try:
-            totals.append(parse_fio_json_multi(r.out)[f"{side}_mbps"])
-        except (ValueError, KeyError):
+            vals = parse_fio_json_jobs(r.out, rw)
+        except ValueError:
             ctx.abort("fail", "全盘并发 fio 解析失败(输出见 stdout.log)")
+        if len(vals) != len(names):
+            ctx.abort("fail", f"并发 fio 返回 {len(vals)} 个 job,应为 {len(names)}"
+                              "(每盘独立报告),无法按盘对应")
+        totals.append(round(sum(vals), 2))
+        for n, v in zip(names, vals):
+            per_round[n].append(v)
+
+    for n in names:
+        record_rounds(ctx, f"{prefix}_{n}_mb_s", per_round[n])
     all_med = record_rounds(ctx, f"{prefix}_all_mb_s", totals)
     if cpus:
         record_rounds(ctx, f"{prefix}_all_dev_cpu_pct", cpus)
@@ -346,12 +338,13 @@ def _raw_disk_test(ctx: Ctx, rw: str) -> str:
             per_core.append(round(float(statistics.median(vals)), 1) if vals else None)
         ctx.metric(f"{prefix}_all_dev_cpu_per_core", per_core)
 
-    per_str = ", ".join(f"{name} {v}" for name, v in per_disk.items())
-    slow = (min(per_disk.values()) < 0.85 * max(per_disk.values())
-            if len(per_disk) > 1 else False)
+    med_per = {n: float(statistics.median(per_round[n])) for n in names}
+    per_str = ", ".join(f"{n} {round(v, 1)}" for n, v in med_per.items())
+    slow = (min(med_per.values()) < 0.85 * max(med_per.values())
+            if len(med_per) > 1 else False)
     warn = ";盘间差距 >15%,疑似慢盘/异常盘,建议复测并关注 SMART" if slow else ""
-    return (f"裸盘{cn}({len(disks)} 盘): {per_str} MB/s;"
-            f"{len(disks)} 盘并发{cn} {all_med}MB/s{warn}")
+    return (f"裸盘并发{cn}({len(disks)} 盘):合计 {all_med}MB/s;"
+            f"每盘 {per_str} MB/s{warn}")
 
 
 @_impl("s3_raw_read_all")
@@ -362,81 +355,6 @@ def s3_raw_read_all(ctx: Ctx) -> str:
 @_impl("s3_raw_write_all")
 def s3_raw_write_all(ctx: Ctx) -> str:
     return _raw_disk_test(ctx, "write")
-
-
-@_impl("s3_rebuild_monitor")
-def s3_rebuild_monitor(ctx: Ctx) -> str:
-    """人工拔盘后点击运行:确认降级 → 监控重建速度曲线 → 叠加 fio 测 IO 衰减。"""
-    def mdstat():
-        return ctx.sh("cat /proc/mdstat").out
-
-    st = mdstat()
-    degraded = bool(re.search(r"\[_[U_]*\]|\[[U_]*_\]|degraded", st))
-    recovering = "recovery" in st or "resync" in st or "reshape" in st
-    if not degraded and not recovering:
-        ctx.abort("blocked", "阵列当前正常(未降级)。请先按操作指导拔出一块成员盘"
-                             "(或 sudo mdadm --fail /dev/mdX --remove /dev/sdX)后重新运行。")
-    ctx.log("阵列已降级/重建中,开始全程监控(每 30s 记录一次速度)")
-    # 叠加业务 IO:4K 随机读,记录重建期间 IOPS
-    tdir = ctx.cfg.get("device_test_dir", "/vol2/.nastest_perf")
-    ctx.sh(f"mkdir -p {tdir}")
-    ctx.sh(f"fio --name=rebuildload --directory={tdir} --size=1G --rw=randread --bs=4k "
-           f"--ioengine={_pick_fio_engine(ctx)} --iodepth=16 --numjobs=2 --direct=1 "
-           f"--time_based --runtime=14400 "
-           f"> /dev/null 2>&1 &", note="叠加业务 IO 负载(后台)")
-    curve = []
-    t0 = time.time()
-    last_prog = -1.0
-    while True:
-        if ctx.stop_requested():
-            break
-        st = mdstat()
-        prog = re.search(r"=\s*([\d.]+)%", st)
-        speed = re.search(r"speed=([\d.]+)K", st)
-        p = float(prog.group(1)) if prog else None
-        curve.append({"t_min": round((time.time() - t0) / 60, 1),
-                      "progress_pct": p,
-                      "speed_kbps": float(speed.group(1)) if speed else None})
-        if p is not None and p != last_prog:
-            ctx.log(f"重建 {p}% 速度 {speed.group(1) if speed else '?'}KB/s")
-            last_prog = p
-        if not ("recovery" in st or "resync" in st or "reshape" in st):
-            if re.search(r"\[UU+\]|\[[U]+U\]", st.replace(" ", "")) or not re.search(
-                    r"\[_[U_]*\]|\[[U_]*_\]", st):
-                ctx.log("重建完成")
-                break
-        time.sleep(30)
-    ctx.sh("pkill -f 'fio --name=rebuildload' 2>/dev/null || true")
-    ctx.sh(f"rm -f {tdir}/rebuildload.*")
-    dur = round((time.time() - t0) / 60, 1)
-    speeds = [c["speed_kbps"] for c in curve if c["speed_kbps"]]
-    avg_speed = round(sum(speeds) / len(speeds) / 1024, 1) if speeds else None
-    ctx.metric("rebuild_minutes", dur)
-    ctx.metric("rebuild_avg_speed_mb_s", avg_speed)
-    ctx.metric("rebuild_curve", curve[::4])
-    det = detect_md_raid(ctx)
-    if det:
-        ctx.metric("rebuild_raid_level", det)
-    base_iops, ref_id = None, None
-    if det:  # 优先取当前阵列级别对应组的随读基线
-        ref = db.get_result(ctx.run_id, f"S3-{det}-03")
-        if ref and ref["status"] == "pass":
-            base_iops = ref["metrics"].get("rand_read_r_iops")
-            ref_id = f"S3-{det}-03"
-    if base_iops is None:  # 回退:任一组已测的随读 IOPS
-        from .raid import RAID_SUBS
-        for lv in RAID_SUBS:
-            ref = db.get_result(ctx.run_id, f"S3-{lv}-03")
-            if ref and ref["status"] == "pass" and ref["metrics"].get("rand_read_r_iops"):
-                base_iops = ref["metrics"]["rand_read_r_iops"]
-                ref_id = f"S3-{lv}-03"
-                break
-    if base_iops:
-        ctx.metric("baseline_randread_iops", base_iops)
-        ctx.log(f"重建前基线({ref_id}) 随机读 {base_iops} IOPS,"
-                f"请对照重建期间业务 IO 表现评估衰减")
-    return (f"重建监控 {dur} 分钟,平均速度 {avg_speed}MB/s,曲线见 metrics.rebuild_curve;"
-            f"请人工确认重建期间业务 IO 衰减程度(§8:<30% 优)并在备注记录")
 
 
 # ================= S4 网络层 =================

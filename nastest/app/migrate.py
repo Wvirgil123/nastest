@@ -1,7 +1,7 @@
 """一次性数据迁移:旧版 S3 编号 → 新版子组编号(启动时自动执行,幂等)。
 
 旧版:S3-01..10 单一编号,多 RAID 级别靠 metrics 里 raid_<级别>_ 前缀累计;
-新版:S3-BASE-01/02(basic 组)+ S3-<RAID级别>-01..10(五个 RAID 子组),
+新版:S3-BASE-01(basic 组)+ S3-<RAID级别>-01..10(五个 RAID 子组),
      用例编号本身携带 RAID 级别,各组相互独立。
      (09/10 单流顺序读写为新增用例,旧版无对应数据,不参与迁移。)
 
@@ -10,7 +10,7 @@
               逐级别展开为 S3-<级别>-01..08;raid_<级别>_ 前缀剥离后作为该组指标;
               扁平键(最后一次运行结果)只归入最后测试的那个级别;
               证据目录随最后级别迁移。
-  S3-09 → S3-BASE-01,S3-10 → S3-BASE-02(剥离 raid_* 键)。
+  S3-09 → S3-BASE-01(剥离 raid_* 键);旧 S3-10(重建监控)已删除,不再迁移。
 """
 import shutil
 
@@ -65,11 +65,12 @@ def s3_groups() -> None:
                 duration_ms=row.get("duration_ms"),
                 verdict_by=row.get("verdict_by") or "", error=row.get("error") or "")
             n = cid[-2:]
-            if n in ("09", "10"):  # → basic 组(与 RAID 级别无关)
-                new_id = "S3-BASE-01" if n == "09" else "S3-BASE-02"
-                db.ensure_results(rid, [new_id])
-                db.set_result(rid, new_id, metrics=_flat(m), **common)
-                _move_ev(ev_base, cid, new_id)
+            if n == "09":  # → basic 组(与 RAID 级别无关)
+                db.ensure_results(rid, ["S3-BASE-01"])
+                db.set_result(rid, "S3-BASE-01", metrics=_flat(m), **common)
+                _move_ev(ev_base, cid, "S3-BASE-01")
+                continue
+            if n == "10":  # 旧重建监控用例,已删除;数据不迁移,仅清理
                 continue
             # S3-01..08 → 按已测 RAID 级别逐组展开
             levels = _levels(m, cfg)

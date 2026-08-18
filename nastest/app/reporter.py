@@ -192,14 +192,21 @@ def storage_table(results: dict, cfg: dict) -> dict:
 
 
 def raw_table(results: dict) -> list[dict]:
-    """裸盘基线表(S3-BASE-03 读 / S3-BASE-04 写):逐盘 + 全盘并发。
+    """裸盘基线表:S3-BASE-01 单盘读基线 / S3-BASE-03 全盘并发读 / S3-BASE-04 全盘并发写。
 
-    两个用例都无数据时返回 [](报告不渲染此表)。
+    三个用例都无数据时返回 [](报告不渲染此表)。
     """
+    m_01 = _metrics(results, "S3-BASE-01")
     m_r = _metrics(results, "S3-BASE-03")
     m_w = _metrics(results, "S3-BASE-04")
-    if not m_r and not m_w:
+    if not m_01 and not m_r and not m_w:
         return []
+    rows: list[dict] = []
+    if m_01:
+        rows.append({"case": "裸盘读基线(单盘 md 成员)",
+                     "spec": "128k / QD32×1 / 单盘 / 60s×轮",
+                     "mb_s": _m(m_01, "raw_read_mb_s"),
+                     "cpu": None, "cpu_cores": "—"})
     disks: list[str] = []
     for m, key in ((m_r, "raw_read_disks"), (m_w, "raw_write_disks")):
         v = m.get(key)
@@ -207,12 +214,11 @@ def raw_table(results: dict) -> list[dict]:
             for d in v:
                 if isinstance(d, str) and d not in disks:
                     disks.append(d)
-    rows: list[dict] = []
     for m, prefix, label in ((m_r, "raw_read", "裸盘读"), (m_w, "raw_write", "裸盘写")):
         if not m:
             continue
         for d in disks:
-            rows.append({"case": f"{label} {d}", "spec": "1M / QD8 / 单盘 / 30s×轮",
+            rows.append({"case": f"{label} {d}", "spec": "1M / QD4 / 并发每盘 / 30s×轮",
                          "mb_s": _m(m, f"{prefix}_{d}_mb_s"),
                          "cpu": None, "cpu_cores": "—"})
         rows.append({"case": f"{label} {len(disks)} 盘并发",
@@ -398,8 +404,9 @@ def methodology(cfg: dict) -> dict:
                 "每轮 fio 前后对设备打 /proc/stat 快照,差值即该轮整机 CPU%(含内核态),多轮取中位数;",
                 "7 个负载画像:顺序读/写(1M 大块)、4K 随机读/写、4K 混合读写 70/30、QD1 最低延迟、fsync 提交延迟;",
                 "S3-BASE-01 自动从 /proc/mdstat 识别 RAID 成员盘做只读裸盘基线,用于换算文件系统层损耗与 RAID 效率;",
-                "S3-BASE-03/04 枚举 SATA 机械整盘逐盘 + 全盘并发裸盘读/写(bs=1M,30s/轮×轮数取中位数,sudo 直读裸设备);"
-                "裸盘写为破坏性操作,目标盘是活动 md 成员或有挂载/swap 时拒跑;",
+                "S3-BASE-03/04 枚举 SATA 机械整盘做全盘并发裸盘读/写(每盘一个 job,"
+                "bs=1M QD4 size=1G,30s/轮×轮数取中位数,sudo 直读/写裸设备),"
+                "记录每盘速度与并发合计;裸盘写为破坏性操作,目标盘是活动 md 成员或有挂载/swap 时拒跑;",
                 "S3 分为 basic / RAID0 / RAID1 / RAID5 / RAID6 / RAID10 子组:人工切换阵列后运行对应组,"
                 "执行前自动校验 /proc/mdstat 阵列级别,不符拒跑,防止数据串组。",
             ],
@@ -427,13 +434,13 @@ def methodology(cfg: dict) -> dict:
                 f"fio --name=rawread --filename=/dev/sdX --rw=read --bs=128k "
                 f"--ioengine=libaio --iodepth=32 --numjobs=1 --direct=1 "
                 f"--time_based --runtime={rt} --output-format=json",
-                "# 裸盘逐盘 + 全盘并发(S3-BASE-03/04;每轮 30s,写用例破坏数据,拒跑在用盘)\n"
-                "sudo fio --name=raw_read_sda --filename=/dev/sda --rw=read --bs=1M --size=2G "
-                "--ioengine=libaio --iodepth=8 --direct=1 --time_based --runtime=30 --output-format=json\n"
+                "# 裸盘全盘并发(S3-BASE-03 读 / S3-BASE-04 写):每盘一个 job 独立报告,"
+                "每轮 30s;写用例破坏数据,拒跑在用盘\n"
                 "sudo fio --rw=read --bs=1M --size=1G --ioengine=libaio --iodepth=4 --direct=1 "
                 "--time_based --runtime=30 --group_reporting --output-format=json "
                 "--name=d1 --filename=/dev/sda --name=d2 --filename=/dev/sdb "
-                "--name=d3 --filename=/dev/sdc --name=d4 --filename=/dev/sdd",
+                "--name=d3 --filename=/dev/sdc --name=d4 --filename=/dev/sdd\n"
+                "# 写用例(S3-BASE-04)仅将 --rw=read 改为 --rw=write,其余参数相同",
                 "# 每轮 fio 前后各打一次快照(聚合行+逐核行),差值 = 该轮整机与逐核 CPU%\n"
                 "grep '^cpu' /proc/stat",
             ],
@@ -708,6 +715,7 @@ def generate_markdown(run_id: int) -> Path:
     A("")
     _embed("raid_seq", "各 RAID 级别顺序吞吐对比")
     _embed("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")
+    _embed("raw_vs_raid", "裸盘并发与各 RAID 级别顺序读/写对比")
     _embed("protocols", "文件协议读写吞吐横向对比")
     _embed("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽")
     _embed("scale", "并发扩展曲线")
@@ -725,7 +733,7 @@ def generate_markdown(run_id: int) -> Path:
     A("")
     _render_storage_md(A, T["storage"])
     if T["raw"]:
-        A("### 裸盘基线(S3-BASE-03/04,绕过文件系统直读/写裸设备)")
+        A("### 裸盘基线(S3-BASE-01/03/04,绕过文件系统直读/写裸设备)")
         A("")
         A("| 项目 | 参数 | 吞吐(MB/s) | CPU% | 逐核 CPU%(c0..) |")
         A("|---|---|---|---|---|")
@@ -733,7 +741,8 @@ def generate_markdown(run_id: int) -> Path:
             A(f"| {r['case']} | {r['spec']} | {_fmt(r['mb_s'])} | "
               f"{_fmt(r['cpu'])} | {r['cpu_cores']} |")
         A("")
-        A("*逐盘差距 >15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;"
+        A("*单盘基线(BASE-01)用于换算 FS 层损耗与 RAID 效率;"
+          "逐盘差距 >15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;"
           "裸盘写(S3-BASE-04)为破坏性用例,仅盘不在阵列中时可运行。*")
         A("")
     _render_method_md(A, ctx["method"].get("storage"))

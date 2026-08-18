@@ -60,6 +60,7 @@
   <h4 style="margin:18px 0 8px">2.2 图表分析</h4>
   {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
                       ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比"),
+                      ("raw_vs_raid", "裸盘并发与各 RAID 级别顺序读/写对比"),
                       ("protocols", "文件协议读写吞吐横向对比"),
                       ("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽"),
                       ("scale", "并发扩展曲线"),
@@ -121,7 +122,7 @@
   </div>
   {% endif %}
   {% if tables.raw %}
-  <h4 style="margin:14px 0 6px">裸盘基线(S3-BASE-03/04,绕过文件系统直读/写裸设备)</h4>
+  <h4 style="margin:14px 0 6px">裸盘基线(S3-BASE-01/03/04,绕过文件系统直读/写裸设备)</h4>
   <div class="table-scroll">
   <table class="table">
     <thead><tr><th>项目</th><th>参数</th><th>吞吐(MB/s)</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th></tr></thead>
@@ -135,7 +136,7 @@
     </tbody>
   </table>
   </div>
-  <div class="small muted">逐盘差距 &gt;15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;裸盘写(S3-BASE-04)为破坏性用例,仅盘不在阵列中时可运行。</div>
+  <div class="small muted">单盘基线(BASE-01)用于换算 FS 层损耗与 RAID 效率;逐盘差距 &gt;15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;裸盘写(S3-BASE-04)为破坏性用例,仅盘不在阵列中时可运行。</div>
   {% endif %}
   {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
 </section>

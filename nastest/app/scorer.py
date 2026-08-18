@@ -127,14 +127,7 @@ def score_run(run_id: int) -> dict:
         tgrade, tval = "优", "未检测到热降频"
     add("throttle", "热降频", tval, tgrade, "温度-频率-吞吐相关性分析(§8:无降频 优)")
 
-    # 7) 重建期间业务 IO 衰减(人工录入)
-    rebuild = _m(results, "S3-BASE-02", "rebuild_io_degrade_pct")
-    add("rebuild_loss", "重建期间业务 IO 衰减",
-        f"{rebuild}%" if rebuild is not None else "—",
-        _grade(rebuild, 30, 50, 70, lower_better=True),
-        "人工实测录入(§8:<30% 优)")
-
-    # 8) 并发拐点
+    # 7) 并发拐点
     infl_w = _m(results, "S6-01", "write_inflection_n")
     infl_r = _m(results, "S6-02", "read_inflection_n")
     infl = max([v for v in (infl_w, infl_r) if v is not None], default=None)
@@ -144,7 +137,7 @@ def score_run(run_id: int) -> dict:
         f"写拐点 N={int(infl_w) if infl_w else '—'},"
         f"读拐点 N={int(infl_r) if infl_r else '—'}(§8:≥8 路优)")
 
-    # 9) 满容量性能衰减
+    # 8) 满容量性能衰减
     fc = _m(results, "S8-03", "seq_write_degrade_pct")
     add("fullcap_loss", "满容量性能衰减",
         f"{fc}%" if fc is not None else "—",
