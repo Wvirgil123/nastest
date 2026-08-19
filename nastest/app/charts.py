@@ -12,6 +12,7 @@ HTML 报告经 /runs/<id>/charts/<fname> 路由提供。
   05_protocols   文件协议读写吞吐横向对比        (§5.5)
   06_crypto      加密算法性能对比(openssl speed)(§5.1 / §8 AES 红旗)
   07_raw_vs_raid 裸盘并发与各 RAID 级别顺序读写对比 (§5.3)
+  08_raid_seq_1job 各 RAID 级别单流顺序吞吐对比     (§5.3)
 """
 import json
 
@@ -27,6 +28,7 @@ CHART_FILES = {
     "protocols": "05_protocols.png",
     "crypto": "06_crypto.png",
     "raw_vs_raid": "07_raw_vs_raid.png",
+    "raid_seq_1job": "08_raid_seq_1job.png",
 }
 
 # 调色板(色盲安全、专业克制)
@@ -92,6 +94,23 @@ def _raid_series(results: dict) -> dict:
             "seq_write": _m(results, raid.level_case(lv, "02"), "seq_write_w_mbps"),
             "rand_read": _m(results, raid.level_case(lv, "03"), "rand_read_r_iops"),
             "rand_write": _m(results, raid.level_case(lv, "04"), "rand_write_w_iops"),
+        }
+        if any(v is not None for v in vals.values()):
+            out[lv] = vals
+    return out
+
+
+def _raid_seq_1job_series(results: dict) -> dict:
+    """{RAID级别: {seq_read, seq_write}} 单流 1M / QD32 × 1job(S3-<级别>-09/10)。
+
+    与 _raid_series(01/02 多流)对照:机械盘多 job 顺序读磁头交插吞吐腰斩,
+    单流反映 RAID 真实顺序带宽。未测为 None。
+    """
+    out = {}
+    for lv in RAID_ORDER:
+        vals = {
+            "seq_read": _m(results, raid.level_case(lv, "09"), "seq_read_1job_r_mbps"),
+            "seq_write": _m(results, raid.level_case(lv, "10"), "seq_write_1job_w_mbps"),
         }
         if any(v is not None for v in vals.values()):
             out[lv] = vals
@@ -435,6 +454,13 @@ def generate_charts(run_id: int, results: dict, cfg: dict, force: bool = False) 
         [rs[r]["seq_read"] for r in raids], [rs[r]["seq_write"] for r in raids],
         "顺序读", "顺序写", C_BLUE, C_ORANGE, "吞吐 (MB/s)",
         "各 RAID 级别顺序吞吐对比 (1M / QD32 × 4jobs)"))
+    rs1 = _raid_seq_1job_series(results)
+    raids1 = list(rs1.keys())
+    try_draw("raid_seq_1job", lambda: _draw_raid_bars(
+        out / CHART_FILES["raid_seq_1job"], plt, raids1,
+        [rs1[r]["seq_read"] for r in raids1], [rs1[r]["seq_write"] for r in raids1],
+        "顺序读(单流)", "顺序写(单流)", C_BLUE, C_ORANGE, "吞吐 (MB/s)",
+        "各 RAID 级别顺序吞吐对比 (单流 1M / QD32 × 1job)"))
     try_draw("raid_iops", lambda: _draw_raid_bars(
         out / CHART_FILES["raid_iops"], plt, raids,
         [rs[r]["rand_read"] for r in raids], [rs[r]["rand_write"] for r in raids],

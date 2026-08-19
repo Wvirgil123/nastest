@@ -59,6 +59,7 @@
 
   <h4 style="margin:18px 0 8px">2.2 图表分析</h4>
   {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
+                      ("raid_seq_1job", "各 RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job)"),
                       ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比"),
                       ("raw_vs_raid", "裸盘并发与各 RAID 级别顺序读/写对比"),
                       ("protocols", "文件协议读写吞吐横向对比"),

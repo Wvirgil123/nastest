@@ -748,6 +748,7 @@ def generate_markdown(run_id: int) -> Path:
     A("### 2.2 图表分析")
     A("")
     _embed("raid_seq", "各 RAID 级别顺序吞吐对比")
+    _embed("raid_seq_1job", "各 RAID 级别顺序吞吐对比(单流)")
     _embed("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比")
     _embed("raw_vs_raid", "裸盘并发与各 RAID 级别顺序读/写对比")
     _embed("protocols", "文件协议读写吞吐横向对比")
