@@ -121,6 +121,26 @@
   </table>
   </div>
   {% endif %}
+  {% if tables.raid1job %}
+  <h4 style="margin:14px 0 6px">RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job)</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>RAID 级别</th><th>顺序读(MB/s)</th><th>读 CPU%</th><th title="按 c0..cN-1 顺序">读逐核 CPU%</th><th>顺序写(MB/s)</th><th>写 CPU%</th><th title="按 c0..cN-1 顺序">写逐核 CPU%</th></tr></thead>
+    <tbody>
+    {% for r in tables.raid1job %}
+    <tr><td>{{ r.raid }}</td>
+      <td>{{ r.r_mb_s if r.r_mb_s is not none else '—' }}</td>
+      <td>{{ r.r_cpu if r.r_cpu is not none else '—' }}</td>
+      <td class="small">{{ r.r_cores }}</td>
+      <td>{{ r.w_mb_s if r.w_mb_s is not none else '—' }}</td>
+      <td>{{ r.w_cpu if r.w_cpu is not none else '—' }}</td>
+      <td class="small">{{ r.w_cores }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="banner-info small" style="margin-top:6px">单流(numjobs=1)避免机械盘多 job 磁头交插,反映 RAID 真实顺序带宽;多流(QD32 × 4jobs)数据见上方各子表 01/02 行。</div>
+  {% endif %}
   {% if tables.raw %}
   <h4 style="margin:14px 0 6px">裸盘基线(S3-BASE-01/03/04,绕过文件系统直读/写裸设备)</h4>
   <div class="table-scroll">

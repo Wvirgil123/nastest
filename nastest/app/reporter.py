@@ -191,6 +191,32 @@ def storage_table(results: dict, cfg: dict) -> dict:
     return {"multi": False, "levels": [{"raid": raid_lbl, "rows": rows}], "hint": ""}
 
 
+def raid_1job_table(results: dict) -> list[dict]:
+    """RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job,S3-<级别>-09/10)。
+
+    每个有 09/10 数据的 RAID 级别一行:顺序读/写吞吐 + 整机 CPU% + 逐核 CPU%。
+    全部级别均无数据时返回 [](报告不渲染此表)。
+    单流 numjobs=1 避免机械盘多 job 磁头交插,反映 RAID 真实顺序带宽,
+    与各子表中 01/02 多流(QD32 × 4jobs)数据对照。
+    """
+    rows = []
+    for lv in RAID_ORDER:
+        m_r = _metrics(results, raid.level_case(lv, "09"))
+        m_w = _metrics(results, raid.level_case(lv, "10"))
+        if not m_r and not m_w:
+            continue
+        rows.append({
+            "raid": lv,
+            "r_mb_s": _m(m_r, "seq_read_1job_r_mbps"),
+            "r_cpu": _cpu(m_r, "seq_read_1job"),
+            "r_cores": _fmt_cores(_lst(m_r, "seq_read_1job_dev_cpu_per_core")),
+            "w_mb_s": _m(m_w, "seq_write_1job_w_mbps"),
+            "w_cpu": _cpu(m_w, "seq_write_1job"),
+            "w_cores": _fmt_cores(_lst(m_w, "seq_write_1job_dev_cpu_per_core")),
+        })
+    return rows
+
+
 def raw_table(results: dict) -> list[dict]:
     """裸盘基线表:S3-BASE-01 单盘读基线 / S3-BASE-03 全盘并发读 / S3-BASE-04 全盘并发写。
 
@@ -403,6 +429,8 @@ def methodology(cfg: dict) -> dict:
                 f"每个 profile 先热身 {warm}s,再正式跑 {rounds} 轮取中位数,轮间波动 >10% 自动标记可信度下降;",
                 "每轮 fio 前后对设备打 /proc/stat 快照,差值即该轮整机 CPU%(含内核态),多轮取中位数;",
                 "7 个负载画像:顺序读/写(1M 大块)、4K 随机读/写、4K 混合读写 70/30、QD1 最低延迟、fsync 提交延迟;",
+                "S3-<级别>-09/10 单流顺序读/写(1M / QD32 × 1job):机械盘多 job 顺序读会因磁头在多路文件间"
+                "交插寻道而吞吐腰斩,单流用例测 RAID 真实顺序带宽上限,与 01/02 多流对照;",
                 "S3-BASE-01 自动从 /proc/mdstat 识别 RAID 成员盘做只读裸盘基线,用于换算文件系统层损耗与 RAID 效率;",
                 "S3-BASE-03/04 枚举 SATA 机械整盘做全盘并发裸盘读/写(每盘一个 job,"
                 "bs=1M QD4 size=1G,30s/轮×轮数取中位数,sudo 直读/写裸设备),"
@@ -425,6 +453,10 @@ def methodology(cfg: dict) -> dict:
                 f"# 顺序读(S3-<RAID级别>-01);框架自动选择异步引擎(libaio/io_uring),否则 sync 引擎会把 iodepth 压到 1\n"
                 f"fio --name=seq_read --directory={tdir} --size={size} --rw=read --bs=1M "
                 f"--ioengine=libaio --iodepth=32 --numjobs=4 --direct=1 "
+                f"--time_based --runtime={rt} --group_reporting --output-format=json",
+                f"# 顺序读单流(S3-<RAID级别>-09;numjobs=1 避免机械盘多 job 磁头交插,测 RAID 真实顺序带宽)\n"
+                f"fio --name=seq_read_1job --directory={tdir} --size={size} --rw=read --bs=1M "
+                f"--ioengine=libaio --iodepth=32 --numjobs=1 --direct=1 "
                 f"--time_based --runtime={rt} --group_reporting --output-format=json",
                 f"# fsync 提交延迟(S3-<RAID级别>-07)\n"
                 f"fio --name=fsync_lat --directory={tdir} --size={size} --rw=write --bs=4k "
@@ -636,6 +668,7 @@ def report_context(run_id: int, regen_charts: bool = False) -> dict:
         "baseline": baseline_card(results),
         "tables": {
             "storage": storage_table(results, run["config"]),
+            "raid1job": raid_1job_table(results),
             "raw": raw_table(results),
             "protocol": protocol_table(results),
             "scale": scale_table(results),
@@ -733,6 +766,19 @@ def generate_markdown(run_id: int) -> Path:
     A("## 三、存储子系统(§5.3,中位数)")
     A("")
     _render_storage_md(A, T["storage"])
+    if T["raid1job"]:
+        A("### RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job)")
+        A("")
+        A("| RAID 级别 | 顺序读(MB/s) | 读 CPU% | 读逐核 CPU%(c0..) | "
+          "顺序写(MB/s) | 写 CPU% | 写逐核 CPU%(c0..) |")
+        A("|---|---|---|---|---|---|---|")
+        for r in T["raid1job"]:
+            A(f"| {r['raid']} | {_fmt(r['r_mb_s'])} | {_fmt(r['r_cpu'])} | {r['r_cores']} | "
+              f"{_fmt(r['w_mb_s'])} | {_fmt(r['w_cpu'])} | {r['w_cores']} |")
+        A("")
+        A("*单流(numjobs=1)避免机械盘多 job 磁头交插,反映 RAID 真实顺序带宽;"
+          "多流(QD32 × 4jobs)数据见上方各子表 01/02 行。*")
+        A("")
     if T["raw"]:
         A("### 裸盘基线(S3-BASE-01/03/04,绕过文件系统直读/写裸设备)")
         A("")
