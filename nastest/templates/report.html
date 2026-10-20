@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}性能报告 · {{ run.name }}{% endblock %}
 {% block content %}
+{% set charts = charts | default({}) %}
 <div class="report-head">
   <div class="page-head">
     <h1>{{ run.name }} — ARM-NAS 极限性能报告</h1>
@@ -42,9 +43,12 @@
   {% endif %}
 </section>
 
-<!-- 四问答 -->
+<!-- 综合分析 -->
 <section class="card">
-  <h3>二、四个核心问题(§1)</h3>
+  <h3>二、综合分析</h3>
+
+  <h4 style="margin:18px 0 8px">2.1 综合分析(§1 四个核心问题)</h4>
+  <div class="small muted" style="margin-bottom:8px">以下四个核心问题为基于实测数据的自动结论;人工综合分析待补充。</div>
   {% for fq in score.four_questions %}
   <div class="qa">
     <b>{{ fq.q }}</b>
@@ -52,6 +56,30 @@
     <div class="detail">{{ fq.detail }}</div>
   </div>
   {% endfor %}
+
+  <h4 style="margin:18px 0 8px">2.2 图表分析</h4>
+  {% for key, alt in [("raid_seq", "各 RAID 级别顺序吞吐对比"),
+                      ("raid_seq_1job", "各 RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job)"),
+                      ("raid_iops", "各 RAID 级别 4K 随机 IOPS 对比"),
+                      ("raw_vs_raid", "裸盘并发与各 RAID 级别顺序读/写对比"),
+                      ("protocols", "文件协议读写吞吐横向对比"),
+                      ("bottleneck", "瓶颈逐层衰减:从线速到应用可用带宽"),
+                      ("scale", "并发扩展曲线"),
+                      ("crypto", "加密算法性能对比(openssl speed)")] %}
+  {% if charts.get(key) %}<img class="chart" src="/runs/{{ run.id }}/charts/{{ charts[key] }}" alt="{{ alt }}">{% endif %}
+  {% endfor %}
+
+  <h4 style="margin:18px 0 8px">2.3 各指标含义</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th style="width:180px">指标</th><th>含义</th><th>判读要点</th></tr></thead>
+    <tbody>
+    {% for g in glossary %}
+    <tr><td><b>{{ g.name }}</b></td><td class="small">{{ g.meaning }}</td><td class="small">{{ g.judge }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
 </section>
 
 <!-- 存储表(按 RAID 细分) -->
@@ -63,13 +91,13 @@
     <h4 style="margin:14px 0 6px">{{ lv.raid }}</h4>
     <div class="table-scroll">
     <table class="table">
-      <thead><tr><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th>备注</th></tr></thead>
+      <thead><tr><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th><th>备注</th></tr></thead>
       <tbody>
       {% for r in lv.rows %}
       <tr><td>{{ r.case }} <span class="mono muted small">{{ r.case_id }}</span></td><td class="small">{{ r.spec }}</td>
         <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
         <td>{{ r.p50 if r.p50 is not none else '—' }}</td><td>{{ r.p99 if r.p99 is not none else '—' }}</td>
-        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.note }}</td></tr>
+        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.cpu_cores or '—' }}</td><td class="small">{{ r.note }}</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -78,21 +106,58 @@
   {% else %}
   <div class="table-scroll">
   <table class="table">
-    <thead><tr><th>RAID</th><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th>备注</th></tr></thead>
+    <thead><tr><th>RAID</th><th>用例</th><th>bs/QD/jobs</th><th>吞吐(MB/s)</th><th>IOPS</th><th>P50(μs)</th><th>P99(μs)</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th><th>备注</th></tr></thead>
     <tbody>
     {% for r in tables.storage.levels[0].rows %}
       {% if r.empty %}
-      <tr class="muted"><td>{{ r.raid }}</td><td>{{ r.case }}</td><td>{{ r.spec }}</td><td colspan="5">—</td><td>未测</td></tr>
+      <tr class="muted"><td>{{ r.raid }}</td><td>{{ r.case }}</td><td>{{ r.spec }}</td><td colspan="6">—</td><td>未测</td></tr>
       {% else %}
       <tr><td>{{ r.raid }}</td><td>{{ r.case }} <span class="mono muted small">{{ r.case_id }}</span></td><td class="small">{{ r.spec }}</td>
         <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
         <td>{{ r.p50 if r.p50 is not none else '—' }}</td><td>{{ r.p99 if r.p99 is not none else '—' }}</td>
-        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.note }}</td></tr>
+        <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.cpu_cores or '—' }}</td><td class="small">{{ r.note }}</td></tr>
       {% endif %}
     {% endfor %}
     </tbody>
   </table>
   </div>
+  {% endif %}
+  {% if tables.raid1job %}
+  <h4 style="margin:14px 0 6px">RAID 级别顺序吞吐对比(单流 1M / QD32 × 1job)</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>RAID 级别</th><th>顺序读(MB/s)</th><th>读 CPU%</th><th title="按 c0..cN-1 顺序">读逐核 CPU%</th><th>顺序写(MB/s)</th><th>写 CPU%</th><th title="按 c0..cN-1 顺序">写逐核 CPU%</th></tr></thead>
+    <tbody>
+    {% for r in tables.raid1job %}
+    <tr><td>{{ r.raid }}</td>
+      <td>{{ r.r_mb_s if r.r_mb_s is not none else '—' }}</td>
+      <td>{{ r.r_cpu if r.r_cpu is not none else '—' }}</td>
+      <td class="small">{{ r.r_cores }}</td>
+      <td>{{ r.w_mb_s if r.w_mb_s is not none else '—' }}</td>
+      <td>{{ r.w_cpu if r.w_cpu is not none else '—' }}</td>
+      <td class="small">{{ r.w_cores }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="banner-info small" style="margin-top:6px">单流(numjobs=1)避免机械盘多 job 磁头交插,反映 RAID 真实顺序带宽;多流(QD32 × 4jobs)数据见上方各子表 01/02 行。</div>
+  {% endif %}
+  {% if tables.raw %}
+  <h4 style="margin:14px 0 6px">裸盘基线(S3-BASE-01/03/04,绕过文件系统直读/写裸设备)</h4>
+  <div class="table-scroll">
+  <table class="table">
+    <thead><tr><th>项目</th><th>参数</th><th>吞吐(MB/s)</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th></tr></thead>
+    <tbody>
+    {% for r in tables.raw %}
+    <tr><td>{{ r.case }}</td><td class="small">{{ r.spec }}</td>
+      <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td>
+      <td>{{ r.cpu if r.cpu is not none else '—' }}</td>
+      <td class="small">{{ r.cpu_cores or '—' }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <div class="small muted">单盘基线(BASE-01)用于换算 FS 层损耗与 RAID 效率;逐盘差距 &gt;15% 提示慢盘/异常盘;并发合计≈单盘之和说明 SATA 控制器无瓶颈;裸盘写(S3-BASE-04)为破坏性用例,仅盘不在阵列中时可运行。</div>
   {% endif %}
   {% with entry = method.storage %}{% include "_method_block.html" %}{% endwith %}
 </section>
@@ -102,12 +167,12 @@
   <h3>四、文件协议(§5.5)</h3>
   <div class="table-scroll">
   <table class="table">
-    <thead><tr><th>协议</th><th>负载</th><th>吞吐(MB/s)</th><th>IOPS</th><th>CPU%</th><th>加密</th><th>备注</th></tr></thead>
+    <thead><tr><th>协议</th><th>负载</th><th>吞吐(MB/s)</th><th>IOPS</th><th>CPU%</th><th title="按 c0..cN-1 顺序">逐核 CPU%</th><th>加密</th><th>备注</th></tr></thead>
     <tbody>
     {% for r in tables.protocol %}
     <tr><td>{{ r.proto }}</td><td>{{ r.load }}</td>
       <td>{{ r.mb_s if r.mb_s is not none else '—' }}</td><td>{{ r.iops if r.iops is not none else '—' }}</td>
-      <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td>{{ r.enc or '—' }}</td><td class="small">{{ r.note }}</td></tr>
+      <td>{{ r.cpu if r.cpu is not none else '—' }}</td><td class="small">{{ r.cpu_cores or '—' }}</td><td>{{ r.enc or '—' }}</td><td class="small">{{ r.note }}</td></tr>
     {% endfor %}
     </tbody>
   </table>

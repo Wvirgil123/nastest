@@ -5,9 +5,9 @@ import subprocess
 import time
 
 from . import db, evidence, raid, sampler
-from .ctx import (Ctx, device_nic, device_snapshot, device_delta, fio_cmd,
-                  iperf_cleanup, iperf_servers, make_soak_sample_fn,
-                  record_rounds, require_device_tool)
+from .ctx import (Ctx, _pick_fio_engine, device_nic, device_snapshot,
+                  device_delta, fio_cmd, iperf_cleanup, iperf_servers,
+                  make_soak_sample_fn, record_rounds, require_device_tool)
 
 IMPL: dict[str, callable] = {}
 
@@ -101,7 +101,8 @@ def s8_soak(ctx: Ctx) -> str:
            f"> /tmp/nastest_soak_cpu.log 2>&1 & echo $!", note="stress-ng CPU 满载(后台)")
     # 2) IO 压力(持续混合读写)
     ctx.sh(f"nohup fio --name=soak --directory={tdir} --size=1G --rw=randrw --rwmixread=70 "
-           f"--bs=4k --iodepth=32 --numjobs=4 --direct=1 --time_based --runtime={secs} "
+           f"--bs=4k --ioengine={_pick_fio_engine(ctx)} --iodepth=32 --numjobs=4 "
+           f"--direct=1 --time_based --runtime={secs} "
            f"> /tmp/nastest_soak_fio.log 2>&1 & echo $!", note="fio 持续混合 IO(后台)")
     # 3) 网络压力(本机有 iperf3 时)
     import shutil as _sh
@@ -258,7 +259,7 @@ def s8_full_capacity(ctx: Ctx) -> str:
         from .parse import parse_fio_json
         res = {}
         for key, want in (("seq_write", "w_mbps"), ("rand_write", "w_iops")):
-            r = ctx.sh(fio_cmd(key, tdir, 30, "2G"), timeout=600,
+            r = ctx.sh(fio_cmd(ctx, key, tdir, 30, "2G"), timeout=600,
                        note=f"满容量复测 {key}(30s)")
             try:
                 p = parse_fio_json(r.out)

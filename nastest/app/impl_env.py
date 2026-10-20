@@ -138,7 +138,7 @@ def s0_background(ctx: Ctx) -> str:
 
 @_impl("s0_client_selfcheck")
 def s0_client_selfcheck(ctx: Ctx) -> str:
-    from .ctx import fio_cmd, require_local_tool
+    from .ctx import _pick_fio_engine, require_local_tool
     require_local_tool(ctx, "fio")
     d = ctx.cfg.get("local_fio_dir") or str(Path.home() / ".nastest_local_selfcheck")
     ctx.sh_local(["mkdir", "-p", d], note="本机自检目录")
@@ -147,8 +147,10 @@ def s0_client_selfcheck(ctx: Ctx) -> str:
         ctx.abort("blocked", f"{d} 在 tmpfs 上,测的是内存不是磁盘!"
                              f"请在配置 local_fio_dir 指定一个真实磁盘路径(如 NVMe 挂载点)")
     cmd = ("fio --name=selfcheck --directory=" + d +
-           " --size=2G --rw=randrw --rwmixread=70 --bs=4k --iodepth=64 --numjobs=4"
-           " --direct=1 --time_based --runtime=30 --group_reporting --output-format=json")
+           " --size=2G --rw=randrw --rwmixread=70 --bs=4k"
+           " --ioengine=" + _pick_fio_engine(ctx, local=True) +
+           " --iodepth=64 --numjobs=4 --direct=1 --time_based --runtime=30"
+           " --group_reporting --output-format=json")
     r = ctx.sh_local(cmd, timeout=180, note="本机 NVMe randrw 70/30 QD64×4")
     if r.rc != 0:
         ctx.abort("fail", f"本机 fio 自检失败 rc={r.rc}")

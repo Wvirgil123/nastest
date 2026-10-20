@@ -116,8 +116,13 @@ class Executor:
             res = db.get_result(self.run_id, cid)
             if res and res["status"] in ("pass", "fail", "skipped"):
                 continue
-            # 依赖检查
             case = BY_ID[cid]
+            # 高危(破坏性)用例不进自动批量:必须人工确认安全后单独运行并输入编号
+            if case.hazard == "critical":
+                db.set_result(self.run_id, cid, status="manual_pending",
+                              actual="高危(破坏性)用例,自动阶段不执行;确认安全后在用例行单独运行并输入编号")
+                continue
+            # 依赖检查
             dep_bad = [d for d in case.deps
                        if (db.get_result(self.run_id, d) or {}).get("status") != "pass"]
             if dep_bad:

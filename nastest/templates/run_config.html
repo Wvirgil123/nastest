@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}修改配置 · 任务 #{{ run_id }} · ARM-NAS 极限性能测试{% endblock %}
+{% block content %}
+<h1>修改配置 · 任务 #{{ run_id }}</h1>
+<p class="muted">
+  修改对之后执行的用例生效(每条用例执行时读取最新配置),不影响已完成的结果;
+  任务运行中不可修改,请先暂停或中止。
+  <a href="/runs/{{ run_id }}">← 返回任务</a>
+</p>
+{% set submit_url = '/api/runs/' ~ run_id ~ '/config' %}
+{% set submit_label = '保存修改' %}
+{% set name_value = run_name %}
+{% include "_run_form.html" %}
+{% endblock %}

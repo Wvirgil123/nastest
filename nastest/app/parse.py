@@ -62,6 +62,23 @@ def parse_fio_json(text: str) -> dict:
     return out
 
 
+def parse_fio_json_jobs(text: str, side: str) -> list[float]:
+    """多 job fio(裸盘并发测试每盘一个 job):按 jobs 数组顺序返回每个 job 的带宽 MB/s。
+
+    parse_fio_json 只取 jobs[0],适用于单 job/同名合并的场景;裸盘并发用例
+    每块盘一个 --name/--filename 且不加 --group_reporting(它会合并全部 job),
+    故 jobs 数组每盘一条,逐个取出用于「每盘速度 + 合计」。
+    """
+    data = _extract_json(text)
+    jobs = data.get("jobs") or []
+    if not jobs:
+        raise ValueError("fio JSON 无 jobs")
+    vals = [round(((j.get(side) or {}).get("bw") or 0) / 1024.0, 2) for j in jobs]
+    if not any(v > 0 for v in vals):
+        raise ValueError(f"fio JSON 各 job 均无 {side} 带宽")
+    return vals
+
+
 def parse_fio_fsync(text: str) -> dict:
     """fsync=1 用例:取 fsync 延迟分布。"""
     data = _extract_json(text)
